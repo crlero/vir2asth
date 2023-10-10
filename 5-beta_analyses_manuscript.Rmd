@@ -1,0 +1,526 @@
+---
+title: "Beta diversity analyses"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Input files
+```{r}
+phylo_ra_file <- "data/vOTUs.processed.RA.RData"
+core_file <- "results/core_vfc.tsv"
+beta_file <- "results/STABLE2.tsv"
+```
+
+# Load packages and data
+```{r}
+source("utils.R")
+library(DT)
+load(phylo_ra_file, verbose = T)
+presabs_vfc <- read_tsv(core_file)
+betadf <- read_tsv(beta_file)
+```
+
+# Load distances
+## vOTUs
+```{r}
+dist.uni_all <- readRDS("data/distance_species_all_unifrac.rds")[[1]]
+dist.jacc_all <- readRDS("data/distance_species_all_jaccard.rds")[[1]]
+dist.wuni_trans_all <- readRDS("data/distance_species_all_wunifrac.rds")[[1]]
+dist.can_all <- readRDS("data/distance_species_all_canberra.rds")[[1]]
+dist.aitch_all <- readRDS("data/distance_species_all_euclidean.rds")[[1]]
+
+dist.uni_temp <- readRDS("data/distance_species_temperate_unifrac.rds")[[1]]
+dist.jacc_temp <- readRDS("data/distance_species_temperate_jaccard.rds")[[1]]
+dist.wuni_trans_temp <- readRDS("data/distance_species_temperate_wunifrac.rds")[[1]]
+dist.can_temp <- readRDS("data/distance_species_temperate_canberra.rds")[[1]]
+dist.aitch_temp <- readRDS("data/distance_species_temperate_euclidean.rds")[[1]]
+
+dist.uni_vir <- readRDS("data/distance_species_virulent_unifrac.rds")[[1]]
+dist.jacc_vir <- readRDS("data/distance_species_virulent_jaccard.rds")[[1]]
+dist.wuni_trans_vir <- readRDS("data/distance_species_virulent_wunifrac.rds")[[1]]
+dist.can_vir <- readRDS("data/distance_species_virulent_canberra.rds")[[1]]
+dist.aitch_vir <- readRDS("data/distance_species_virulent_euclidean.rds")[[1]]
+```
+
+## VFCs
+```{r}
+dist.uni_all_vfc <- readRDS("data/distance_famid_all_unifrac.rds")[[1]]
+dist.jacc_all_vfc <- readRDS("data/distance_famid_all_jaccard.rds")[[1]]
+dist.wuni_all_vfc <- readRDS("data/distance_famid_all_wunifrac.rds")[[1]]
+dist.can_all_vfc <- readRDS("data/distance_famid_all_canberra.rds")[[1]]
+dist.aitch_all_vfc <- readRDS("data/distance_famid_all_euclidean.rds")[[1]]
+
+dist.uni_temp_vfc <- readRDS("data/distance_famid_temperate_unifrac.rds")[[1]]
+dist.jacc_temp_vfc <- readRDS("data/distance_famid_temperate_jaccard.rds")[[1]]
+dist.wuni_temp_vfc <- readRDS("data/distance_famid_temperate_wunifrac.rds")[[1]]
+dist.can_temp_vfc <- readRDS("data/distance_famid_temperate_canberra.rds")[[1]]
+dist.aitch_temp_vfc <- readRDS("data/distance_famid_temperate_euclidean.rds")[[1]]
+
+dist.uni_vir_vfc <- readRDS("data/distance_famid_virulent_unifrac.rds")[[1]]
+dist.jacc_vir_vfc <- readRDS("data/distance_famid_virulent_jaccard.rds")[[1]]
+dist.wuni_trans_vir_vfc <- readRDS("data/distance_famid_virulent_wunifrac.rds")[[1]]
+dist.can_vir_vfc <- readRDS("data/distance_famid_virulent_canberra.rds")[[1]]
+dist.aitch_vir_vfc <- readRDS("data/distance_famid_virulent_euclidean.rds")[[1]]
+```
+
+## Create table for species
+```{r}
+betadf |> 
+  filter(tax == "species") |> 
+  mutate(virclass = factor(virclass, levels = c("all", "temperate", "virulent", "unknown"))) |> 
+  arrange(virclass, pval) |> 
+  dplyr::select(R2, `F`, pval, virclass, method) |> 
+  dt()
+```
+
+## Create table for VFC
+```{r}
+betadf |> 
+  filter(tax == "famid") |> 
+  mutate(virclass = factor(virclass, levels = c("all", "temperate", "virulent", "unknown"))) |> 
+  arrange(virclass, pval) |> 
+  dplyr::select(R2, `F`, pval, virclass, method) |> 
+  dt()
+```
+
+# Preproc virome
+```{r}
+# Remove J45 NAs (no follow-up 5 years)
+physeqf <- subset_samples(physeq, !is.na(j45_5yr_ever))
+physeqf <- subset_taxa(physeqf, taxa_sums(physeqf)>0)
+physeqf
+
+physeqf_abs <- subset_samples(physeq_abs, !is.na(j45_5yr_ever))
+```
+
+# MDS visualisation
+## FIG2A
+```{r}
+# DBRDA - condition by lane
+physeqf_all_vfc <- speedyseq::tax_glom(physeqf, "famid")
+rdares_aitch_all_vfc <- mydbrda(subset_dist(dist.aitch_all_vfc, physeqf_all_vfc), physeqf_all_vfc)
+
+# get SCORES for samples
+scores <- data.frame(scores(rdares_aitch_all_vfc,
+                            display = "sites",
+                            choices=c(1,2,3,4,5,6,7,8),
+                            center=TRUE)) |>
+  tibble::rownames_to_column("abcno")
+
+phenodat <- sample_df(physeqf_all_vfc) |>
+  left_join(scores)
+
+# Plot MDS
+axis1 <- round(rdares_aitch_all_vfc$CA$eig[["MDS1"]] / rdares_aitch_all_vfc$tot.chi * 100, 2)
+axis2 <- round(rdares_aitch_all_vfc$CA$eig[["MDS2"]] / rdares_aitch_all_vfc$tot.chi * 100, 2)
+
+df <- betadf |> filter(tax == "famid" & method == "euclidean" & virclass == "all") 
+mds.vfc_all_aitch <- ggplot(phenodat, aes(x=MDS1, y=MDS2)) +
+  stat_ellipse(aes(color=j45_5yr_ever, fill=j45_5yr_ever),
+               geom = "polygon",
+               alpha=.3,
+               size=.20, level=.9, type="t") +
+  geom_point(aes(fill=j45_5yr_ever),
+             pch = 21, stroke = .3, size = 2.5, alpha = .9,
+             color="white") +
+  scale_fill_manual(values = color_map) +
+  scale_color_manual(values =  c(color_map, class_color)) +
+  xlab(paste0("MDS1 (", axis1, "%)")) +
+  ylab(paste0("MDS2 (", axis2, "%)")) +
+  labs(title = "Overall",
+       subtitle = paste0("PERMANOVA, R2(%): ",
+                         round(df$R2 * 100, 2),
+                         "; P = ",
+                         df$pval)) +
+  guides(fill="none", color="none") +
+  theme_minimal()
+
+mds.vfc_all_aitch
+```
+
+```{r}
+xplot <- ggplot(mds.vfc_all_aitch$data, aes(
+                              #x=j45_5yr_ever, 
+                              y=MDS1, fill=j45_5yr_ever)) +
+  geom_density(alpha=.7, color="white") +
+  scale_fill_manual(values = color_map) +
+  theme_void() +
+  guides(fill="none") +
+  labs(caption=paste0("P = ", wilcox.test(mds.vfc_all_aitch$data$MDS1 ~ mds.vfc_all_aitch$data$j45_5yr_ever)$p.value |> roundex(3)))
+
+yplot <- ggplot(mds.vfc_all_aitch$data, aes(
+                              #x=j45_5yr_ever, 
+                              y=MDS2, fill=j45_5yr_ever)) +
+  geom_density(alpha=.7, color="white") +
+  scale_fill_manual(values = color_map) +
+  theme_void() +
+  guides(fill="none") +
+  labs(caption=paste0("P = ", wilcox.test(mds.vfc_all_aitch$data$MDS2 ~ mds.vfc_all_aitch$data$j45_5yr_ever)$p.value |> roundex(3)))
+
+p1 <- ggarrange(xplot + coord_flip(), NULL, mds.vfc_all_aitch, yplot, 
+          ncol = 2, nrow = 2,
+          align = "hv", 
+          widths = c(1.5, .5),
+          heights = c(1, 2))
+p1
+```
+
+## FIG2B
+```{r}
+# DBRDA - condition by lane
+physeqf_temp_vfc <- physeqf |> subset_taxa(virulence == " 0") |> speedyseq::tax_glom("famid")
+rdares_aitch_temp_vfc <- mydbrda(subset_dist(dist.aitch_temp_vfc, physeqf_temp_vfc), physeqf_temp_vfc)
+
+# get SCORES for samples
+scores <- data.frame(scores(rdares_aitch_temp_vfc,
+                            display = "sites",
+                            choices=c(1,2,3,4,5,6,7,8),
+                            center=TRUE)) |>
+  tibble::rownames_to_column("abcno")
+
+phenodat <- sample_df(physeqf_temp_vfc) |>
+  left_join(scores)
+
+# Plot MDS
+axis1 <- round(rdares_aitch_temp_vfc$CA$eig[["MDS1"]] / rdares_aitch_temp_vfc$tot.chi * 100, 2)
+axis2 <- round(rdares_aitch_temp_vfc$CA$eig[["MDS2"]] / rdares_aitch_temp_vfc$tot.chi * 100, 2)
+
+df <- betadf |> filter(tax == "famid" & method == "euclidean" & virclass == "temperate") 
+mds.vfc_temp_aitch <- ggplot(phenodat, aes(x=MDS1, y=MDS2)) +
+  stat_ellipse(aes(color=j45_5yr_ever, fill=j45_5yr_ever),
+               geom = "polygon",
+               alpha=.3,
+               size=.20, level=.9, type="t") +
+  geom_point(aes(fill=j45_5yr_ever),
+             pch = 21, stroke = .3, size = 2.5, alpha = .9,
+             color="white") +
+  scale_fill_manual(values = color_map) +
+  scale_color_manual(values =  c(color_map, class_color)) +
+  xlab(paste0("MDS1 (", axis1, "%)")) +
+  ylab(paste0("MDS2 (", axis2, "%)")) +
+  labs(title = "Temperate",
+       subtitle = paste0("PERMANOVA, R2(%): ",
+                         round(df$R2 * 100, 2),
+                         "; P = ",
+                         df$pval)) +
+  guides(fill="none", color="none") +
+  theme_minimal()
+mds.vfc_temp_aitch
+```
+
+```{r}
+xplot <- ggplot(mds.vfc_temp_aitch$data, aes(
+                              #x=j45_5yr_ever, 
+                              y=MDS1, fill=j45_5yr_ever)) +
+  geom_density(alpha=.7, color="white") +
+  scale_fill_manual(values = color_map) +
+  theme_void() +
+  guides(fill="none") +
+  labs(caption=paste0("P = ", wilcox.test(mds.vfc_temp_aitch$data$MDS1 ~ mds.vfc_temp_aitch$data$j45_5yr_ever)$p.value |> roundex(3)))
+
+yplot <- ggplot(mds.vfc_temp_aitch$data, aes(
+                              #x=j45_5yr_ever, 
+                              y=MDS2, fill=j45_5yr_ever)) +
+  geom_density(alpha=.7, color="white") +
+  scale_fill_manual(values = color_map) +
+  theme_void() +
+  guides(fill="none") +
+  labs(caption=paste0("P = ", wilcox.test(mds.vfc_temp_aitch$data$MDS2 ~ mds.vfc_temp_aitch$data$j45_5yr_ever)$p.value |> roundex(3)))
+
+p2 <- ggarrange(xplot + coord_flip(), NULL, mds.vfc_temp_aitch, yplot, 
+          ncol = 2, nrow = 2,
+          align = "hv", 
+          widths = c(1.5, .5),
+          heights = c(1, 2))
+p2
+```
+
+## FIG2C
+```{r}
+# DBRDA - condition by lane
+physeqf_vir_vfc <- physeqf |> subset_taxa(virulence == " 1") |> speedyseq::tax_glom("famid")
+rdares_aitch_vir_vfc <- mydbrda(subset_dist(dist.aitch_vir_vfc, physeqf_vir_vfc), physeqf_vir_vfc)
+
+# get SCORES for samples
+scores <- data.frame(scores(rdares_aitch_vir_vfc,
+                            display = "sites",
+                            choices=c(1,2,3,4,5,6,7,8),
+                            center=TRUE)) |>
+  tibble::rownames_to_column("abcno")
+
+phenodat <- sample_df(physeqf_temp_vfc) |>
+  left_join(scores)
+
+# Plot MDS
+axis1 <- round(rdares_aitch_vir_vfc$CA$eig[["MDS1"]] / rdares_aitch_vir_vfc$tot.chi * 100, 2)
+axis2 <- round(rdares_aitch_vir_vfc$CA$eig[["MDS2"]] / rdares_aitch_vir_vfc$tot.chi * 100, 2)
+
+df <- betadf |> filter(tax == "famid" & method == "euclidean" & virclass == "virulent") 
+
+mds.vfc_vir_aitch <- ggplot(phenodat, aes(x=MDS1, y=MDS2)) +
+  stat_ellipse(aes(color=j45_5yr_ever, fill=j45_5yr_ever),
+               geom = "polygon",
+               alpha=.3,
+               size=.20, level=.9, type="t") +
+  geom_point(aes(fill=j45_5yr_ever),
+             pch = 21, stroke = .3, size = 2.5, alpha = .9,
+             color="white") +
+  scale_fill_manual(values = color_map) +
+  scale_color_manual(values =  c(color_map, class_color)) +
+  xlab(paste0("MDS1 (", axis1, "%)")) +
+  ylab(paste0("MDS2 (", axis2, "%)")) +
+  labs(title = "Virulent",
+       subtitle = paste0("PERMANOVA, R2(%): ",
+                         round(df$R2 * 100, 2),
+                         "; P = ",
+                         df$pval)) +
+  guides(fill="none", color="none") +
+  theme_minimal()
+mds.vfc_vir_aitch
+```
+
+```{r}
+xplot <- ggplot(mds.vfc_vir_aitch$data, aes(
+                              #x=j45_5yr_ever, 
+                              y=MDS1, fill=j45_5yr_ever)) +
+  geom_density(alpha=.7, color="white") +
+  scale_fill_manual(values = color_map) +
+  theme_void() +
+  guides(fill="none") +
+  labs(caption=paste0("P = ", wilcox.test(mds.vfc_vir_aitch$data$MDS1 ~ mds.vfc_vir_aitch$data$j45_5yr_ever)$p.value |> roundex(3)))
+
+yplot <- ggplot(mds.vfc_vir_aitch$data, aes(
+                              #x=j45_5yr_ever, 
+                              y=MDS2, fill=j45_5yr_ever)) +
+  geom_density(alpha=.7, color="white") +
+  scale_fill_manual(values = color_map) +
+  theme_void() +
+  guides(fill="none") +
+  labs(caption=paste0("P = ", wilcox.test(mds.vfc_vir_aitch$data$MDS2 ~ mds.vfc_vir_aitch$data$j45_5yr_ever)$p.value |> roundex(3)))
+
+p3 <- ggarrange(xplot + coord_flip(), NULL, mds.vfc_vir_aitch, yplot, 
+          ncol = 2, nrow = 2,
+          align = "hv", 
+          widths = c(1.5, .5),
+          heights = c(1, 2))
+
+p3
+```
+
+```{r}
+cowplot::plot_grid(p1, p2, p3, nrow=1)
+ggsave("figures/FIG2.pdf", width=10, height=3)
+```
+
+# EDFIG5
+## overall
+```{r}
+pl_all <- ggplot(betadf |> filter(virclass == "all"),
+                 aes(x=R2*100, y=-log10(pval), fill=method, shape=method, color=method)) +
+  geom_hline(yintercept=-log10(0.05), linetype=2, lwd=.25) +
+  geom_point(size=3, stroke=1.2) +
+  scale_shape_manual(values=1:nlevels(factor(betadf$method))) +
+  facet_wrap(~factor(ifelse(tax == "species", "vOTU", "VFC"), levels=c("vOTU", "VFC"))) +
+  xlab("R2 (%)") + ylab("-Log10(Pval)") +
+  theme_bw(base_size = 12) +
+  ylim(0, 3) + xlim(0.05, 0.22) +
+  ggtitle("Overall")
+pl_all
+```
+
+## temperate
+```{r}
+pl_temp <- ggplot(betadf |> filter(virclass == "temperate"),
+                 aes(x=R2*100, y=-log10(pval), fill=method, shape=method, color=method)) + # only lane
+  geom_hline(yintercept=-log10(0.05), linetype=2, lwd=.25) +
+  geom_point(size=3, stroke=1.2) +
+  scale_shape_manual(values=1:nlevels(factor(betadf$method))) +
+  facet_wrap(~factor(ifelse(tax == "species", "vOTU", "VFC"), levels=c("vOTU", "VFC"))) +
+  xlab("R2 (%)") + ylab("-Log10(Pval)") +
+  theme_bw(base_size = 12) +
+  ylim(0, 3) + xlim(0.05, 0.22) +
+  ggtitle("Temperate")
+pl_temp
+```
+
+## virulent
+```{r}
+pl_vir <- ggplot(betadf |> filter(virclass == "virulent"),
+                 aes(x=R2*100, y=-log10(pval), fill=method, shape=method, color=method)) +
+  geom_hline(yintercept=-log10(0.05), linetype=2, lwd=.25) +
+  geom_point(size=3, stroke=1.2) +
+  scale_shape_manual(values=1:nlevels(factor(betadf$method))) +
+  facet_wrap(~factor(ifelse(tax == "species", "vOTU", "VFC"), levels=c("vOTU", "VFC"))) +
+  xlab("R2 (%)") + ylab("-Log10(Pval)") +
+  theme_bw(base_size = 12) +
+  ylim(0, 3) + xlim(0.05, 0.22) +
+  ggtitle("Virulent")
+pl_vir
+```
+
+## unknown
+```{r}
+pl_unknown <- ggplot(betadf |> filter(virclass == "unknown"),
+                 aes(x=R2*100, y=-log10(pval), fill=method, shape=method, color=method)) + # only lane
+  geom_hline(yintercept=-log10(0.05), linetype=2, lwd=.25) +
+  geom_point(size=3, stroke=1.2) +
+  scale_shape_manual(values=1:nlevels(factor(betadf$method))) +
+  facet_wrap(~factor(ifelse(tax == "species", "vOTU", "VFC"), levels=c("vOTU", "VFC"))) +
+  xlab("R2 (%)") + ylab("-Log10(Pval)") +
+  theme_bw(base_size = 12) +
+  ylim(0, 3) + xlim(0.05, 0.22) +
+  ggtitle("Unknown")
+pl_unknown
+```
+
+
+## merged plot
+```{r, fig.width=12, fig.height=6}
+cowplot::plot_grid(pl_all + theme(legend.position="bottom"),
+                   pl_temp + theme(legend.position="bottom"), 
+                   pl_vir + theme(legend.position="bottom"),
+                   pl_unknown + theme(legend.position="bottom"),
+                   nrow=2)
+
+ggsave("figures/EDFIG5.pdf", device="pdf",
+       width=8, height=6)
+```
+
+# SFIG3
+## asthma-mother interaction
+```{r}
+sample_data(physeqf)$mapDepth_log <- log(sample_data(physeqf)$mapDepth)
+adores.i <- myadonis(dist.aitch_temp_vfc, physeqf, 
+         var = "j45_5yr_ever",
+         block = "lane",
+         covars = c("mapDepth", "mapDepth_log", "propOTU", "efficiency", "asthma_mother"),
+         interaction = "asthma_mother",
+         nproc = 3)
+```
+
+## asthma_mother == 1 (stratified)
+```{r}
+adores.1 <- myadonis(dist.aitch_temp_vfc, subset_samples(physeqf, asthma_mother == "1"), 
+         var = "j45_5yr_ever",
+         block = "lane",
+         covars = c("mapDepth", "mapDepth_log", "propOTU", "efficiency"),
+         nproc = 3)
+```
+
+## asthma_mother == 0 (stratified)
+```{r}
+adores.0 <- myadonis(dist.aitch_temp_vfc, subset_samples(physeqf, asthma_mother == "0"), 
+         var = "j45_5yr_ever",
+         block = "lane",
+         covars = c("mapDepth", "mapDepth_log", "propOTU", "efficiency"),
+         nproc = 3)
+```
+
+## temperate
+```{r}
+# DBRDA - condition by lane
+physeqf_temp_vfc <- physeqf |> subset_taxa(virulence == " 0") |> speedyseq::tax_glom("famid")
+rdares_aitch_temp_vfc1 <- mydbrda(subset_dist(dist.aitch_temp_vfc, physeqf_temp_vfc), physeqf_temp_vfc)
+
+# get SCORES for samples
+scores <- data.frame(scores(rdares_aitch_temp_vfc,
+                            display = "sites",
+                            choices=c(1,2,3,4,5,6,7,8),
+                            center=TRUE)) |>
+  tibble::rownames_to_column("abcno")
+
+phenodat <- sample_df(physeqf_temp_vfc) |>
+  left_join(scores)
+
+# Plot MDS
+axis1 <- round(rdares_aitch_temp_vfc$CA$eig[["MDS1"]] / rdares_aitch_temp_vfc$tot.chi * 100, 2)
+axis2 <- round(rdares_aitch_temp_vfc$CA$eig[["MDS2"]] / rdares_aitch_temp_vfc$tot.chi * 100, 2)
+
+df <- betadf |> filter(tax == "famid" & method =="euclidean" & virclass == "temperate") 
+
+mds.vfc_temp_aitch <- ggplot(phenodat, aes(x=MDS1, y=MDS2)) +
+  stat_ellipse(aes(color=j45_5yr_ever, fill=j45_5yr_ever),
+               geom = "polygon",
+               alpha=.3,
+               size=.20, level=.9, type="t") +
+  geom_point(aes(fill=j45_5yr_ever),
+             pch = 21, stroke = .3, size = 2.5, alpha = .9,
+             color="white") +
+  scale_fill_manual(values = color_map) +
+  scale_color_manual(values =  c(color_map, class_color)) +
+  xlab(paste0("MDS1 (", axis1, "%)")) +
+  ylab(paste0("MDS2 (", axis2, "%)")) +
+  labs(title = "",
+       subtitle = paste0("PERMANOVA, R2(%): ",
+                         round(df$R2 * 100, 2),
+                         "; P = ",
+                         df$pval)) +
+  guides(fill="none", color="none") +
+  theme_minimal()
+mds.vfc_temp_aitch
+```
+
+```{r}
+mds.vfc_temp_aitch.1 <- ggplot(phenodat |> 
+                                 filter(asthma_mother == 1),
+                               aes(x=MDS1, y=MDS2)) +
+  stat_ellipse(aes(color=j45_5yr_ever, fill=j45_5yr_ever),
+               geom = "polygon",
+               alpha=.3,
+               size=.20, level=.9, type="t") +
+  geom_point(aes(fill=j45_5yr_ever),
+             pch = 21, stroke = .3, size = 2.5, alpha = .9,
+             color="white") +
+  scale_fill_manual(values = color_map) +
+  scale_color_manual(values =  c(color_map, class_color)) +
+  xlab(paste0("MDS1 (", axis1, "%)")) +
+  ylab(paste0("MDS2 (", axis2, "%)")) +
+  labs(title = "Asthmatic mothers",
+       subtitle = paste0("PERMANOVA, R2(%): ",
+                         round(adores.1$R2 * 100, 2),
+                         "; P = ",
+                         adores.1$pval)) +
+  guides(fill="none", color="none") +
+  theme_minimal()
+mds.vfc_temp_aitch.1
+```
+
+```{r}
+mds.vfc_temp_aitch.0 <- ggplot(phenodat |> 
+                                 filter(asthma_mother == 0),
+                               aes(x=MDS1, y=MDS2)) +
+  stat_ellipse(aes(color=j45_5yr_ever, fill=j45_5yr_ever),
+               geom = "polygon",
+               alpha=.3,
+               size=.20, level=.9, type="t") +
+  geom_point(aes(fill=j45_5yr_ever),
+             pch = 21, stroke = .3, size = 2.5, alpha = .9,
+             color="white") +
+  scale_fill_manual(values = color_map) +
+  scale_color_manual(values =  c(color_map, class_color)) +
+  xlab(paste0("MDS1 (", axis1, "%)")) +
+  ylab(paste0("MDS2 (", axis2, "%)")) +
+  labs(title = "Non-asthmatic mothers",
+       subtitle = paste0("PERMANOVA, R2(%): ",
+                         round(adores.0$R2 * 100, 2),
+                         "; P = ",
+                         adores.0$pval)) +
+  guides(fill="none", color="none") +
+  theme_minimal()
+mds.vfc_temp_aitch.0
+```
+
+```{r, fig.height=6, fig.width=12}
+cowplot::plot_grid(mds.vfc_temp_aitch,
+                   mds.vfc_temp_aitch.1,
+                   mds.vfc_temp_aitch.0,
+                   nrow=1)
+ggsave("figures/SFIG3.pdf", width=10, height=3)
+```
+
+# session info
+```{r}
+sessionInfo()
+```
+

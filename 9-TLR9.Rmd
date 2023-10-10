@@ -1,0 +1,261 @@
+---
+title: "Phageome, asthma and TLR9 SNP"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Load packages and data
+```{r}
+source("utils.R")
+library(gtools)
+library(lmtest)
+load("data/vOTUs.processed.RA.RData", verbose=TRUE)
+load("resources/X.RData", verbose = T)
+phenodata_all <- X
+virome_pls_score_vfc <- read_tsv("results/virome_scores.tsv")
+gut_score <- readxl::read_excel("resources/gut_scores_1y.xlsx")
+tlr9_genotypes <- read_tsv("results/COPSAC_2010_HRC1.1_Sanger_genotypes.tsv")
+```
+
+# Preproc virome
+```{r}
+# Remove J45 NAs (no follow-up 5 years)
+physeqf <- subset_samples(physeq, !is.na(j45_5yr_ever))
+physeqf <- subset_taxa(physeqf, taxa_sums(physeqf)>0)
+physeqf
+
+# filter to temperate
+physeqft <- subset_taxa(physeqf, virulence == " 0")
+physeqft
+
+# agglomerate to VFCs
+physeqft_fam <- physeqft |> 
+  speedyseq::tax_glom("famid")
+taxa_names(physeqft_fam) <- paste0("f_", str_trim(tax_df(physeqft_fam)$famid))
+physeqft_fam
+
+phenodat <- sample_df(physeqf)
+```
+
+# Virome score ~ TLR9
+```{r}
+virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> 
+              dplyr::select(abcno, tlr9_rs187084_G) |> 
+              mutate(abcno = as.character(abcno))) |> 
+  filter(!is.na(tlr9_rs187084_G)) |>
+  lm(zscore_vir_pls_score ~ as.factor(tlr9_rs187084_G),
+     data=_) |> 
+  tidylog(conf.int=T)
+```
+
+# Asthma ~ TLR9
+```{r}
+virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> 
+              dplyr::select(abcno, tlr9_rs187084_G) |> 
+              mutate(abcno = as.character(abcno))) |> 
+  filter(!is.na(tlr9_rs187084_G)) |>
+  glm(j45_5yr_ever ~ as.factor(tlr9_rs187084_G),
+      data=_,
+      family="binomial") |>
+  tidylog(exp=T, conf.int=T)
+```
+
+# Asthma ~ score + TLR9 + asthma:TLR9
+```{r}
+virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> 
+              dplyr::select(abcno, tlr9_rs187084_G) |>
+              mutate(abcno = as.character(abcno))) |> 
+  filter(!is.na(tlr9_rs187084_G)) |>
+  mutate(tlr9 = factor(tlr9_rs187084_G)) |> 
+  ggplot(aes(x=tlr9, y=zscore_vir_pls_score, fill=j45_5yr_ever)) +
+    geom_boxplot() +
+    stat_compare_means()
+```
+
+## Virome
+```{r}
+# dominant model
+m1.dom <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |>
+              dplyr::select(abcno, tlr9_rs187084_G) |>
+              mutate(abcno = as.character(abcno))) |>
+  mutate(tlr9 = case_when(tlr9_rs187084_G == 0 ~ 1,
+                          tlr9_rs187084_G == 1 ~ 1,
+                          tlr9_rs187084_G == 2 ~ 0)) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score*tlr9,
+      data=_, 
+      family="binomial") 
+
+tidylog(m1.dom, exp=T, conf.int=T)
+
+# over-dominant model
+m1.overdom <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> 
+              dplyr::select(abcno, tlr9_rs187084_G) |>
+              mutate(abcno = as.character(abcno))) |>
+  mutate(tlr9 = case_when(tlr9_rs187084_G == 0 ~ 0,
+                          tlr9_rs187084_G == 1 ~ 1,
+                          tlr9_rs187084_G == 2 ~ 0)) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score*tlr9,
+      data=_,
+      family="binomial") 
+
+tidylog(m1.overdom, exp=T, conf.int=T)
+
+# recessive model
+m1.rec <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |>
+              dplyr::select(abcno, tlr9_rs187084_G) |>
+              mutate(abcno = as.character(abcno))) |>
+  mutate(tlr9 = case_when(tlr9_rs187084_G == 0 ~ 0,
+                          tlr9_rs187084_G == 1 ~ 1,
+                          tlr9_rs187084_G == 2 ~ 1)) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score*tlr9,
+      data=_,
+      family="binomial") 
+
+tidylog(m1.rec, exp=T, conf.int=T)
+```
+
+## 16S
+```{r}
+# dominant model
+gut_score |> 
+  mutate(zscore_bac_pls_score = scale(j45_cross_pls_1y_all)) |> 
+  left_join(tlr9_genotypes |>
+              rename(abcno = ID) |>
+              mutate(abcno = as.character(abcno))) |> 
+  left_join(phenodata_all |> 
+              dplyr::select(abcno, j45_5yr_ever) |>
+              mutate(abcno = as.character(abcno))) |> 
+  mutate(tlr9 = case_when(rs187084_G == 0 ~ 1,
+                      rs187084_G == 1 ~ 1,
+                      rs187084_G == 2 ~ 0)) |>
+  glm(j45_5yr_ever ~ zscore_bac_pls_score*tlr9, data=_, family="binomial") |> 
+  tidylog(exp=T, conf.int=T)
+
+# over-dominant model
+gut_score |> 
+  mutate(zscore_bac_pls_score = scale(j45_cross_pls_1y_all)) |> 
+  left_join(tlr9_genotypes |>
+              rename(abcno = ID) |> 
+              mutate(abcno = as.character(abcno))) |> 
+  left_join(phenodata_all |>
+              select(abcno, j45_5yr_ever) |>
+              mutate(abcno = as.character(abcno))) |> 
+  mutate(tlr9 = case_when(rs187084_G == 0 ~ 0,
+                      rs187084_G == 1 ~ 1,
+                      rs187084_G == 2 ~ 0)) |>
+  glm(j45_5yr_ever ~ zscore_bac_pls_score*tlr9,
+      data=_,
+      family="binomial") |> 
+  tidylog(exp=T, conf.int=T)
+
+# recessive model
+gut_score |> 
+  mutate(zscore_bac_pls_score = scale(j45_cross_pls_1y_all)) |> 
+  left_join(tlr9_genotypes |>
+              rename(abcno = ID) |>
+              mutate(abcno = as.character(abcno))) |> 
+  left_join(phenodata_all |>
+              select(abcno, j45_5yr_ever) |>
+              mutate(abcno = as.character(abcno))) |> 
+  mutate(tlr9 = case_when(rs187084_G == 0 ~ 0,
+                      rs187084_G == 1 ~ 1,
+                      rs187084_G == 2 ~ 1)) |>
+  glm(j45_5yr_ever ~ zscore_bac_pls_score*tlr9,
+      data=_,
+      family="binomial") |> 
+  tidylog(exp=T, conf.int=T)
+```
+
+
+## LRT
+# Asthma ~ score + TLR9
+```{r}
+# dominant model
+m0.dom <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> 
+              dplyr::select(abcno, tlr9_rs187084_G) |> 
+              mutate(abcno = as.character(abcno))) |> 
+  filter(!is.na(tlr9_rs187084_G)) |>
+  mutate(tlr9 = case_when(tlr9_rs187084_G == 0 ~ 1,
+                          tlr9_rs187084_G == 1 ~ 1,
+                          tlr9_rs187084_G == 2 ~ 0)) |>
+  glm(j45_5yr_ever ~ zscore_vir_pls_score + tlr9,
+      data=_,
+      family="binomial")
+
+tidylog(m0.dom, exp=T, conf.int=T)
+```
+
+```{r}
+lrtest(m0.dom, m1.dom)
+```
+
+## FIG5F
+### AA
+```{r}
+m1_aa <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |>
+  filter(tlr9_rs187084_G == 0) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family="binomial") 
+
+tidylog(m1_aa, exp=T, conf.int=T)
+```
+
+### AG
+```{r}
+m1_ag <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |>
+  filter(tlr9_rs187084_G == 1) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family="binomial") 
+
+tidylog(m1_ag, exp=T, conf.int=T)
+```
+
+### GG
+```{r}
+m1_gg <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |>
+  filter(tlr9_rs187084_G == 2) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family="binomial") 
+
+tidylog(m1_gg, exp=T, conf.int=T)
+```
+
+```{r}
+data.frame(term = factor(c("AA", "AG", "GG"),
+                         levels=c("AA", "AG", "GG")),
+           estimate = c(1.2379933, 1.5129239, 0.6848541),
+           conf.low = c(0.8715824, 1.1197100, 0.3526741),
+           conf.high = c(1.9694150, 2.0570035, 1.240593)) |> 
+  ggplot(aes(x=term, y=estimate)) +
+  geom_point(position=position_dodge(width=0.2)) +
+  geom_linerange(aes(x=term, ymin=conf.low, ymax=conf.high),
+                 position=position_dodge(width=0.2)) +
+  xlab("") + ylab("Estimate") +
+  geom_hline(yintercept=1, linetype=2, lwd=0.25) +
+  theme_pubr(base_size = 12) +
+  ylab("OR")
+ggsave("figures/FIG5F.pdf", device="pdf", width=3, height=2.5)
+```
+
+# session info
+```{r}
+sessionInfo()
+```

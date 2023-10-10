@@ -1,0 +1,583 @@
+---
+title: "sPLS classification"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+
+# Load packages and data
+```{r}
+source("utils.R")
+library(circlize)
+library(ComplexHeatmap)
+library(microViz)
+source("nepisods_trols_glm.R")
+
+load("data/vOTUs.processed.RA.RData", verbose = T)
+load("resources/dada2_gtdb_2020_07_13.RData", verbose = T)
+load("resources/J45_diagnosis/J45_cox_cross_220705.rdata", verbose = T)
+load("resources/X.RData", verbose = T)
+gut_score <- readxl::read_excel("resources/gut_scores_1y.xlsx")
+family_host <- read_tsv("resources/fig1.data4.tab")
+core_vfc <- read_tsv("results/core_vfc.tsv") |>
+  mutate(group = case_when(prevalence_cat == "[-Inf,0.02)" ~ "very rare",
+                           prevalence_cat == "[0.02,0.2)" ~ "rare",
+                           prevalence_cat == "[0.2,0.5)" ~ "common",
+                           prevalence_cat == "[0.5, Inf)" ~ "core")) |> 
+  dplyr::select(OTU, prevalence, group) |> 
+  rename(famid = OTU) |> 
+  unique() |> 
+  arrange(desc(prevalence))
+
+phenodata_all <- X
+physeq
+```
+
+# Preproc virome
+```{r}
+# Remove J45 NAs (no follow-up 5 years)
+physeqf <- subset_samples(physeq, !is.na(j45_5yr_ever))
+physeqf <- subset_taxa(physeqf, taxa_sums(physeqf)>0)
+physeqf
+
+# filter to temperate
+physeqft <- subset_taxa(physeqf, virulence == " 0")
+physeqft
+
+# agglomerate to VFCs
+physeqft_fam <- physeqft |> 
+  speedyseq::tax_glom("famid")
+taxa_names(physeqft_fam) <- paste0("f_", str_trim(tax_df(physeqft_fam)$famid))
+physeqft_fam
+```
+
+# Preproc 16S
+```{r}
+# Remove other timepoints, remove NA asthma
+phy <- subset_samples(phy, sample_data(phy)$Time == "1y")
+phy
+
+# add sample data
+samdat <- sample_data(phy) |> data.frame() |> rename(abcno = ABCNO) |>
+  mutate(abcno = as.character(abcno)) |> 
+  left_join(J45_cox_cross |> mutate(abcno = as.character(abcno)))
+rownames(samdat) <- sample_names(phy)
+sample_data(phy) <- sample_data(samdat)
+
+# filter to abcno in virome
+phy <- subset_samples(phy, abcno %in% sample_df(physeqf)$abcno)
+sample_names(phy) <- sample_df(phy)$abcno
+
+phy <- prune_taxa(taxa_sums(phy) > 0, phy)
+phy
+
+tax_table(phy) <- tax_df(phy) |> 
+  mutate(Genus = str_replace_all(str_trim(as.character(Genus)), "-", "_")) |> 
+  dplyr::select(-tax) |> 
+  as.matrix()
+
+# Agglomerate to genus
+print("STEP: Agglomerate taxonomic level")
+phy.g <- speedyseq::tax_glom(phy, "Genus")
+taxa_names(phy.g) <- paste0("g_", tax_df(phy.g)$Genus)
+phy.g
+```
+
+# sPLS
+```{r}
+keep <- prevalence_df(physeqft_fam) |> filter(prevalence >= 50) |> pull(tax)
+physeq_selected <- subset_taxa(physeqft_fam, taxa_names(physeqft_fam) %in% keep) |> 
+  transform_phy(transform = "compositional") |> 
+   transform_phy(transform = "log")
+
+physeq_selected
+```
+
+```{r}
+data <- physeq_selected |>
+  otu_table() |> t() |> data.frame() |> 
+  mutate(Class = as.character(sample_df(physeq_selected)$j45_5yr_ever))
+
+
+table(data$Class)
+head(data)[,1:10]
+```
+
+## CV round 1
+```{r, fig.width=5, fig.height=4}
+ctrl <- caret::trainControl(method="repeatedcv",
+                            number=10,
+                            repeats=10,
+                            returnResamp = "all",
+                            savePredictions = "all",
+                            allowParallel = T,
+                            verboseIter=TRUE)
+
+list.keepX = c(seq(2,20,1),
+               seq(20, floor(ncol(data)/3),20),
+               seq(ceiling(ncol(data)/3), floor(ncol(data)/2),25),
+               seq(ceiling(ncol(data)/2), ncol(data)-1,30),
+               ncol(data)-1)
+list.keepX
+doParallel::registerDoParallel(cores = 2)
+set.seed(111)
+splsda_model_relab_all_fam <- train(as.numeric(Class == "1") ~ .,
+                      data = data,
+                      method = get_mixOmics_spls(),
+                      preProc = c("center", "scale"),
+                      metric = "Rsquared",
+                      tuneGrid = expand.grid(ncomp = 1,
+                                             keepX = list.keepX,
+                                             keepY = 1),
+                      trControl = ctrl)
+
+
+reps_auc <- splsda_model_relab_all_fam |>
+  get_best_predictions() |>
+  group_by(Rep) |>
+  summarize(auc = as.numeric(pROC::auc(obs, pred, direction = "<")))|>
+  arrange(desc(auc))
+
+# print AUC for each repeat
+reps_auc
+
+# extract best repetition
+bestRep <- splsda_model_relab_all_fam |>
+  get_best_predictions() |> group_by(Rep) |>
+  summarize(auc = as.numeric(pROC::auc(obs, pred, direction = "<"))) |>
+  arrange(desc(auc)) |>
+  (\(x) x[1, "Rep"])() |>
+  as.character()
+
+# extract predictions for calculating CV AUC from best repetition
+savedPreds <- splsda_model_relab_all_fam |>
+  get_best_predictions() |>
+  filter(Rep == bestRep)
+cvauc.train <- auc(obs ~ pred, direction = "<", data = savedPreds)
+cvauc.train
+
+# plot AUC for each number of features
+vfc_auc_1round <- auc_components_plot(splsda_model_relab_all_fam)
+vfc_auc_1round
+ggsave("figures/SFIG2.pdf", device="pdf", dpi=300, height=4, width=6)
+```
+
+## CV round 2
+```{r, fig.width=8, fig.height=4}
+registerDoParallel(cores = 2)
+set.seed(111)
+splsda_model_relab_all_fam2 <- train(as.numeric(Class == "1") ~ .,
+                      data = data,
+                      method = get_mixOmics_spls(),
+                      preProc = c("center", "scale"),
+                      metric = "Rsquared",
+                      tuneGrid = expand.grid(ncomp = 1, 
+                                             keepX = seq(10, 25, 1), 
+                                             keepY = 1),
+                      trControl = ctrl)
+
+
+reps_auc <- splsda_model_relab_all_fam2 |> 
+  get_best_predictions() |> 
+  group_by(Rep) |> 
+  summarize(auc = as.numeric(pROC::auc(obs, pred)))|>
+  arrange(desc(auc))
+reps_auc
+
+bestRep <- splsda_model_relab_all_fam2 |> 
+  get_best_predictions() |> group_by(Rep) |> 
+  summarize(auc = as.numeric(pROC::auc(obs, pred)))|> 
+  arrange(desc(auc)) |>
+  (\(x) x[1, "Rep"])() |> 
+  as.character()
+
+savedPreds <- splsda_model_relab_all_fam2 |> 
+  get_best_predictions() |> 
+  filter(Rep == bestRep)
+cvauc.train <- auc(obs ~ pred, data = savedPreds)
+
+auc_components_plot(splsda_model_relab_all_fam2)
+```
+
+## CV round 3
+```{r, fig.width=8, fig.height=4}
+registerDoParallel(cores = 3)
+set.seed(111)
+splsda_model_relab_all_fam3 <- train(as.numeric(Class == "1") ~ .,
+                      data = data,
+                      method = get_mixOmics_spls(),
+                      preProc = c("center", "scale"),
+                      metric = "Rsquared",
+                      tuneGrid = expand.grid(ncomp = 1,
+                                             keepX = 19, 
+                                             keepY = 1),
+                      trControl = ctrl, fixX = c(19))
+
+
+reps_auc <- splsda_model_relab_all_fam3 |> 
+  get_best_predictions() |> 
+  group_by(Rep) |> 
+  summarize(auc = as.numeric(pROC::auc(obs, pred, direction = "<")))|> 
+  arrange(desc(auc))
+reps_auc
+
+bestRep <- splsda_model_relab_all_fam3 |> 
+  get_best_predictions() |> group_by(Rep) |> 
+  summarize(auc = as.numeric(pROC::auc(obs, pred, direction = "<"))) |>
+  arrange(desc(auc)) |>
+  (\(x) x[1, "Rep"])() |> 
+  as.character()
+
+savedPreds <- splsda_model_relab_all_fam3 |> 
+  get_best_predictions() |>
+  filter(Rep == bestRep)
+cvauc.train <- auc(obs ~ pred, direction = "<", data = savedPreds)
+
+splsda_model_relab_all_fam3$bestTune
+```
+
+## FIG3A
+```{r, fig.width=4, fig.height=4}
+df = data.frame(trainpreds = savedPreds$pred,
+                class = ifelse(savedPreds$obs == 1, "Asthma", "Healthy"))
+
+ggplot(df, aes(x=class, y=trainpreds)) +
+  geom_point(aes(color=class, fill=class), pch=21, size=2.5, position=position_jitter(h=0,w=.1)) +
+  geom_boxplot(aes(fill=class), outlier.size=-Inf, width=0.5/2, alpha=.6) +
+  scale_fill_manual(values = color_map2) + scale_color_manual(values =  color_rev_map2) +
+  guides(color="none", fill="none") +
+  xlab("") +
+  ylab("Predictions") +
+  ggtitle(paste0("Repeated ",
+                 splsda_model_relab_all_fam3$control$number, "-fold CV AUC = ", roundex(cvauc.train, 2))) +
+  theme_minimal(base_size=12)
+
+ggsave("figures/FIG3A.pdf", device="pdf", dpi=300, width=4, height=3.5)
+```
+
+
+## Loadings
+```{r}
+## Extract most abundant host
+taxhost <- tax_df(physeqft) |>
+  dplyr::select(class, famid, family, OTU, hostFamily, hostGenus, tax) |>
+  left_join(make_mradat(physeqft) |>
+              dplyr::select(tax, mra, prevalence)) |>
+  mutate(prevalence = prevalence*100)
+```
+
+```{r}
+loadings_df_vfc <- splsda_model_relab_all_fam3 |>
+  get_loadings("CV", remove_empty = F) |>
+  mutate(famid = var, tax = var) |>
+  left_join(tax_df(physeqft_fam) |>
+              dplyr::select(class, famid, family) |>
+              mutate(famid = paste0("f_", str_trim(famid))) |> unique()) |> 
+  left_join(family_host |> mutate(famid = paste0("f_", str_trim(famid))), by=c("famid")) |> 
+  left_join(make_mradat(physeqft_fam) |> dplyr::select(tax, mra)) |> 
+  left_join(prevalence_df(physeqft_fam) |> dplyr::select(tax, prevalence)) |> 
+  arrange(desc(abs(loading)), desc(sd)) |> 
+  head(splsda_model_relab_all_fam3$bestTune$keepX) |> 
+  dplyr::select(-var, -tax) |> 
+  left_join(core_vfc |> dplyr::select(famid, group))
+
+ggplot(loadings_df_vfc |> mutate(f = paste0(family, " (", host, ")")), 
+       aes(fct_reorder(f, prevalence), 
+           loading, ymin = loading - sd, 
+           ymax = loading + sd, fill=host)) +
+  geom_errorbar() +
+  geom_bar(stat = "identity", color="black", lwd=.3) + 
+  coord_flip() + ylab("sPLS loadings") + xlab("VFCs") + 
+  theme_minimal(base_size=12) +
+  ylim(-0.6, 0.2) + 
+  scale_fill_igv() +
+  theme(legend.position = "bottom") +
+  guides(fill="none")
+
+ggsave("figures/FIG3B.pdf", device="pdf", dpi=300, height=4, width=6)
+```
+
+## most common predicted hosts across all 19 VFC
+```{r}
+taxhost |> 
+  filter(paste0("f_", str_trim(famid)) %in% loadings_df_vfc$famid) |> 
+  dplyr::select(famid, hostGenus) |> 
+  filter(!is.na(hostGenus)) |> 
+  group_by(hostGenus) |> 
+  summarise(n = n()) |> 
+  arrange(desc(n))
+```
+
+## chordDiagram
+```{r}
+df <- taxhost |> 
+  mutate(famid = paste0("f_", str_trim(famid))) |> 
+  filter(famid %in% loadings_df_vfc$famid) |> 
+  dplyr::select(hostGenus, famid, family) |> 
+  filter(!is.na(hostGenus)) |> 
+  group_by(hostGenus, family, famid) |> 
+  summarise(value = n()) |> 
+  arrange(family)
+
+# filter hosts with only one vOTU link
+filt <- taxhost |> 
+  mutate(famid = paste0("f_", str_trim(famid))) |> 
+  filter(famid %in% loadings_df_vfc$famid) |> 
+  dplyr::select(family, hostGenus, famid) |> 
+  filter(!is.na(hostGenus)) |>
+  group_by(hostGenus) |> 
+  summarise(n = n()) |> 
+  arrange(n) |> 
+  filter(n > 1)
+
+df <- df |>
+  filter(hostGenus %in% filt$hostGenus)
+```
+
+```{r}
+col.host <- c("Ruminococcus" = "#2596be",
+              "Lactococcus" = "#6bd76b",
+              "Bacteroides" = "#749b58", 
+              "Flavonifractor" = "#802268",
+              "Barnesiella" = "#f0e685",
+              "Anaerostipes" = "#5050ff",
+              "Blautia" = "#466983",
+              "Faecalibacterium" = "#5db1dd",
+              "Tyzzerella" = "#924822",
+              "Collinsella" = "#ba6338",
+              "Bacillus" = "#ce3d32",
+              "Clostridium" = "#8cbb9c",
+              "Coprococcus" = "#8cacbc",
+              "Dorea" = "#bc9c8c",
+              "Enterococcus" = "#bcb48c",
+              "Lachnoclostridium" = "#9c8cbc",
+              "Lactobacillus" = "#acbc8c",
+              "Streptococcus" = "#886464",
+              "Prevotella" = "#06768e",
+              "Oscillobacter" = "#8e1e06",
+              "Paenibacillus" = "#8e6206",
+              "Roseburia" = "#768e06",
+              "Herbaspirillum" = "#1e068e",
+              "Parabacteroides" = "#ad97a9",
+              "Erysipelatoclostridium" = "darkgreen",
+              "Eubacterium" = "goldenrod3",
+              "Clostridioides" = "peachpuff",
+              "Oscillibacter" = "orchid3",
+              "Haemophilus" = "khaki3")
+
+col.vfc <- c("Irisviridae" = "#212121", #VOC1
+             "Sidselviridae" = "#212121",
+             "Hugoviridae" = "#212121",
+             "Madsviridae" = "#212121",
+             "Valdemarviridae" = "#212121",
+             "Ludvigviridae" = "#212121",
+             "Sofieviridae" = "#212121",
+             "Claraviridae" = "#212121",
+             "Pippiviridae" = "#4e342e", #VOC8
+             "Siljaviridae" = "#4e342e",
+             "Adrianviridae" = "#827717", #VOC4
+             "Maisaviridae"  = "#455a64", #VOC2
+             "Inaviridae" = "#455a64",
+             "Arthurviridae" = "#455a64",
+             "Mateoviridae" = "#455a64",
+             "Solviridae" = "#455a64",
+             "Ebbeviridae" = "#26a69a", #VOC3
+             "Damienviridae" = "#f37735", #VOC5
+             "Rasmusviridae" = "#d84315", #crassvirales
+             "Celinaviridae" = "#d84315")
+
+col.grid <- c(col.host, col.vfc)
+```
+
+```{r}
+# sorted from right to left: VFCs highest loading to lowest; hostGenus highest number of vOTUs infecting to lowest
+pdf("figures/EDFIG7.pdf", width=12, height=10)
+par(cex = 0.75, mar = c(0, 0, 0, 0))
+circos.par(start.degree = 90)
+chordDiagram(df, order = c(loadings_df_vfc |> arrange(loading) |> pull(family), filt |> arrange(n) |> pull(hostGenus)),
+             big.gap = 30,
+             grid.col = col.grid,
+             transparency = 0.3,
+             scale = FALSE,
+             preAllocateTracks = 1,
+             annotationTrack = "grid")
+
+# now, the image with rotated labels
+circos.trackPlotRegion(track.index = 1, panel.fun = function(x, y) {
+  xlim = get.cell.meta.data("xlim")
+  ylim = get.cell.meta.data("ylim")
+  sector.name = get.cell.meta.data("sector.index")
+  circos.text(mean(xlim), ylim[1] + .1, sector.name, facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5), col = "black")
+}, bg.border = NA)
+circos.clear()
+dev.off()
+```
+
+## Most prevalent VFC loadings and most abundant predicted host
+```{r}
+prevalence_df(physeqft_fam, taxa = T) |> 
+  filter(tax %in% loadings_df_vfc$famid) |> 
+  dplyr::select(-famid) |> rename(famid = tax) |> 
+  # left_join(famid_most_abundant_host |> rename(famid = tax)) |> 
+  left_join(family_host |> mutate(famid = paste0("f_", str_trim(famid))) |> dplyr::select(famid, host), by=c("famid")) |> 
+  arrange(desc(prevalence)) |> 
+  dplyr::select(family, famid, prevalence, host, everything()) |> 
+  head()
+```
+
+## Less prevalent VFC loadings
+```{r}
+prevalence_df(physeqft_fam, taxa = T) |> 
+  filter(tax %in% loadings_df_vfc$famid) |> 
+  dplyr::select(-famid) |> rename(famid = tax) |> 
+  left_join(family_host |> mutate(famid = paste0("f_", str_trim(famid))) |> dplyr::select(famid, host), by=c("famid")) |> 
+  arrange(prevalence) |> 
+  dplyr::select(family, famid, prevalence, host, everything()) |> 
+  head()
+```
+
+## Strongest effect VFC loadings
+```{r}
+loadings_df_vfc |> 
+  left_join(prevalence_df(physeqft_fam, taxa = T) |> 
+              filter(tax %in% loadings_df_vfc$famid) |> 
+              dplyr::select(-famid) |> rename(famid = tax), by="famid") |> 
+  dplyr::select(family.x, famid, host, loading, everything()) |> 
+  arrange(desc(abs(loading))) |> 
+  head()
+```
+
+## FIG3C
+```{r, fig.width=6, fig.height=4}
+bac.ps <- phy.g |> 
+  transform_phy(transform = "compositional") |> 
+  transform_phy(transform = "log")
+taxa_names(bac.ps) <- str_replace(taxa_names(bac.ps), "g_", "")
+myfams <- loadings_df_vfc$famid
+vir.ps <- subset_taxa(physeqf_fam, taxa_names(physeqf_fam) %in% myfams) |> # bacteriophage phyloseq object at the family level, not re-normalized to temperate
+  subset_samples(abcno %in% sample_names(bac.ps)) |> 
+  transform_phy("log") |> 
+  microViz::ps_reorder(sample_names(bac.ps)) # reorder
+taxa_names(vir.ps) <- tax_df(vir.ps)$family
+vir <- otu_df(vir.ps)
+bac <- otu_df(bac.ps)
+
+cor.res <- t(cor(vir, bac, method = "spearman"))
+cor.res2 <- as.data.frame(as.table(cor.res))
+
+select_cols <- cor.res2 |>
+  mutate(Var1 = as.character(Var1)) |>
+  arrange(desc(Freq)) |>
+  filter(Freq > 0.15 | Freq < -0.15) |> 
+  pull(Var1) |> 
+  unique()
+
+pdf(file ="figures/FIG3C.pdf",
+    width = 13, height = 9)
+Heatmap(t(cor.res)[,select_cols],
+        rect_gp = gpar(col = "white"),
+        row_names_gp = gpar(fontsize = 10),
+        column_names_gp = gpar(fontsize = 10),
+        column_names_rot = 45,
+        column_dend_side = "bottom",
+        column_names_side = "top",
+        clustering_method_rows = "average",
+        clustering_method_columns = "average",
+        col=colorRamp2(c(-.2, 0, .4), c("navy", "white", "red")),
+        heatmap_legend_param = list(title = "Spearman\n(rho)"),
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text(sprintf("%.2f", t(cor.res)[,select_cols][i, j]), x, y, gp =
+                      gpar(fontsize = 7, col="white"))})
+dev.off()
+```
+
+## Save prediction
+```{r}
+save(splsda_model_relab_all_fam3, loadings_df_vfc,
+   reps_auc, file="results/spls_vfc.RData")
+```
+
+# Virome scores
+```{r, fig.width=6, fig.height=3}
+medianRep <- splsda_model_relab_all_fam3 |>
+  get_best_predictions() |> 
+  group_by(Rep) |>
+  summarize(auc = as.numeric(pROC::auc(obs, pred, direction = "<"))) |>
+  arrange(desc(auc)) |>
+  (\(x) x[5, "Rep"])() |> 
+  as.character()
+
+vir_score <- splsda_model_relab_all_fam3 |> 
+  get_best_predictions() |> filter(Rep == medianRep) |> 
+  pull(pred)
+
+virome_pls_score_vfc <- data.frame(abcno = rownames(data),
+                               pls_score = vir_score) |>
+  left_join(dplyr::select(sample_df(physeqft), abcno, j45_5yr_ever, asthma_mother))
+
+# ZSCORE of PLS score (scale and center)
+virome_pls_score_vfc <- virome_pls_score_vfc |>
+  mutate(zscore_vir_pls_score = as.numeric(scale(pls_score))) |> 
+  rename(vir_pls_score = pls_score)
+```
+
+## virome scores vs. asthma
+```{r,fig.width=4, fig.height=3}
+glm(j45_5yr_ever ~ zscore_vir_pls_score,
+    data=virome_pls_score_vfc, family="binomial") |>
+  tidylog(exp=T, conf.int = T)
+```
+
+# 16S scores
+```{r}
+gut_scores <- sample_df(physeqf) |> 
+  dplyr::select(abcno, j45_5yr_ever) |> 
+  left_join(gut_score |>
+              mutate(abcno = as.character(abcno))) |> 
+  dplyr::rename(bac_pls_score = j45_cross_pls_1y_all) |> 
+  mutate(zscore_bac_pls_score = as.numeric(scale(bac_pls_score))) |> 
+  filter(!is.na(zscore_bac_pls_score))
+```
+
+```{r}
+copdat_scores <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno)) |> 
+  left_join(gut_scores |> mutate(abcno = as.character(abcno))) |> 
+  filter(!is.na(bac_pls_score))
+head(copdat_scores)
+```
+
+## 16S score vs. asthma
+```{r}
+glm(j45_5yr_ever ~ zscore_bac_pls_score,
+    data=gut_scores, family="binomial") |>
+  tidylog(exp=T, conf.int = T)
+```
+
+## mutually adjusted model
+```{r}
+glm(j45_5yr_ever ~ zscore_vir_pls_score + zscore_bac_pls_score, data=copdat_scores,
+    family="binomial") |> 
+  tidylog(exp=T, conf.int=T)
+```
+
+```{r}
+write_tsv(virome_pls_score_vfc, file="results/virome_scores.tsv")
+write_tsv(gut_scores, file="results/bac_scores.tsv")
+write_tsv(copdat_scores, file="results/virome_bac_scores.tsv")
+```
+
+# EDFIG6
+```{r}
+myepi(copdat_scores, "zscore_vir_pls_score", "zscore_bac_pls_score", categorical = FALSE)
+ggsave("figures/EDFIG6.pdf", device="pdf", dpi=300, height=2.5, width=3.5)
+```
+
+# session info
+```{r}
+sessionInfo()
+```

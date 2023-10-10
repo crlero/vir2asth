@@ -1,0 +1,1036 @@
+---
+title: "Introduction to infant gut phageomes"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+# Input files
+```{r}
+phylo_ra_file <- "data/vOTUs.processed.RA.RData"
+famid_virdf_file <- "resources/famid_lifestyle.tsv"
+diag_file <- "resources/J45_diagnosis/J45_cox_cross_220705.rdata"
+pheno_file <- "resources/X.RData"
+```
+
+# Output files
+```{r}
+out_tableone <- "results/STABLE1.csv"
+out_tableone_virseq <- "results/STABLE1.virseq.csv"
+```
+
+# Load libraries and data
+```{r}
+source("utils.R")
+library(ggraph)
+library(igraph)
+load(phylo_ra_file, verbose = T)
+load(diag_file, verbose = T)
+famid_virdf <- read_tsv(famid_virdf_file)
+load(pheno_file, verbose = T)
+phenodata_all <- X
+physeq
+```
+
+# Preproc virome
+```{r}
+# Remove J45 NAs (no follow-up 5 years)
+physeqf <- subset_samples(physeq, !is.na(j45_5yr_ever))
+physeqf <- subset_taxa(physeqf, taxa_sums(physeqf)>0)
+physeqf
+
+physeqf_abs <- subset_samples(physeq_abs, !is.na(j45_5yr_ever))
+physeqf_abs <- subset_taxa(physeqf_abs, taxa_sums(physeqf_abs)>0)
+physeqf_abs
+
+# filter to temperate
+physeqft <- subset_taxa(physeqf, virulence == " 0")
+physeqft
+
+physeqft_abs <- subset_taxa(physeqf_abs, virulence == " 0")
+physeqft_abs
+
+# agglomerate to VFCs
+physeqft_fam <- physeqft |> 
+  speedyseq::tax_glom("famid")
+taxa_names(physeqft_fam) <- paste0("f_", str_trim(tax_df(physeqft_fam)$famid))
+physeqft_fam
+
+physeqft_abs_fam <- physeqft_abs |> 
+  speedyseq::tax_glom("famid")
+taxa_names(physeqft_abs_fam) <- paste0("f_", str_trim(tax_df(physeqft_abs_fam)$famid))
+physeqft_abs_fam
+```
+
+# Table One
+```{r}
+print("Loading sample data")
+sampledat <- sample_df(physeq) |>  
+  left_join(phenodata_all |> 
+              dplyr::select(abcno, ab_child_1yr_ever) |> 
+              mutate(abcno = as.character(abcno))) |> 
+  mutate(mother_bmi = as.numeric(as.character(mother_bmi)))
+
+## List numerically coded categorical variables
+factor_vars <- c("batch", "sex", "race", "delivery",
+                 "rural_urban", "catordog", "cat_birth", "dog_birth", "oldchild01",
+                 "asthma_mother", "asthma_father", "dvit", "fishoil", "preeclampsy",
+                 "hospitalizedbirth", "ab_preg_yn", "abbirth", "abbirth_mother", "abbirth_child", "ab_child_1yr_ever", "birthseason")
+
+## Create a variable list. 
+vars <- c("age", "batch", "sex", "race", "birthseason", "rural_urban", 
+          "catordog", "cat_birth", "dog_birth", "oldchild01",
+          "asthma_mother", "asthma_father", "dvit", "fishoil",
+          "preeclampsy", "delivery", "hospitalizedbirth",
+          "motherage", "breast_exclusive",
+          "ab_child_1yr_ever", "ab_preg_yn", "abbirth", "abbirth_mother", "abbirth_child", "birth_weight", "mother_bmi",
+           "n_episodes", 
+          "n_episodes_year_1", "n_episodes_year_2", "n_episodes_year_3")
+
+print("Table One Overall")
+tab <- CreateTableOne(vars = vars,
+                      data = sampledat, factorVars = factor_vars)
+write.csv(print(tab,
+                quote = FALSE, noSpaces = TRUE, printToggle = FALSE),
+          file = out_tableone)
+```
+
+## virome sequencing available vs. virome sequencing not available
+```{r}
+sampledat <- phenodata_all |> mutate(abcno = as.character(abcno)) |> 
+  mutate(mother_bmi = as.numeric(as.character(mother_bmi))) |> 
+  mutate(missing = ifelse(abcno %in% sample_names(physeqf), "0", "1"))
+
+## List numerically coded categorical variables
+factor_vars <- c("sex", "race", "delivery",
+                 "rural_urban", "catordog", "cat_birth", "dog_birth", "oldchild01",
+                 "asthma_mother", "asthma_father", "dvit", "fishoil", "preeclampsy",
+                 "hospitalizedbirth", "ab_preg_yn", "abbirth", "abbirth_mother", "abbirth_child", "ab_child_1yr_ever", "birthseason",
+                 "missing")
+
+## Create a variable list. 
+vars <- c("sex", "race", "birthseason", "rural_urban", 
+          "catordog", "cat_birth", "dog_birth", "oldchild01",
+          "asthma_mother", "asthma_father", "dvit", "fishoil",
+          "preeclampsy", "delivery", "hospitalizedbirth",
+          "motherage", "breast_exclusive",
+          "ab_child_1yr_ever", "ab_preg_yn", "abbirth", "abbirth_mother", "abbirth_child", "birth_weight", "mother_bmi",
+           "n_episodes", 
+          "n_episodes_year_1", "n_episodes_year_2", "n_episodes_year_3",
+          "missing")
+
+pheno <- "missing"
+tab <- CreateTableOne(vars = vars,
+                       strata = pheno,
+                       data = sampledat,
+                       factorVars = factor_vars)
+write.csv(print(tab,
+                quote = FALSE, noSpaces = TRUE, printToggle = FALSE),
+          file = out_tableone_virseq)
+```
+
+
+# First age diagnosis
+```{r, fig.width=6, fig.height=3}
+df <- J45_cox_cross |> 
+  filter(j45_5yr_ever == 1 & as.character(abcno) %in% sample_names(physeqf))
+
+summary(df$eventage_j45_5yr)
+
+ggplot(df, aes(x=eventage_j45_5yr)) +
+  geom_rect(aes(xmin=0,xmax=365.25,ymin=0,ymax=Inf),
+            fill="#f8efe6", alpha=0.05) +
+  geom_rect(aes(xmin=365.25,xmax=365.25*2,ymin=0,ymax=Inf),
+            fill="white",alpha=0.05) +
+  geom_rect(aes(xmin=365.25*2,xmax=365.25*3,ymin=0,ymax=Inf),
+            fill="#f8efe6",alpha=0.05) +
+  geom_rect(aes(xmin=365.25*3,xmax=365.25*4,ymin=0,ymax=Inf),
+            fill="white",alpha=0.05) +
+  geom_rect(aes(xmin=365.25*4,xmax=365.25*5,ymin=0,ymax=Inf),
+            fill="#f8efe6",alpha=0.05) +
+  geom_histogram(aes(y = ..density..), lwd=.5,
+                 colour = 1, fill = "white", alpha=.1) +
+  geom_density(lwd = .75, colour = "#f6511d",
+               fill = "#f6511d", alpha = 0.25) +
+  xlab("Age at first diagnosis (days)") +
+  theme_minimal() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.line = element_blank(),
+        axis.text = element_text(size = 12))
+ggsave("figures/EDFIG1.pdf", device="pdf", dpi=300)
+```
+
+# Median IQR reads
+```{r}
+colSums(otu_table(physeqf_abs)) |>
+  summary()
+ntaxa(physeqf_abs)
+
+taxmat <- tax_df(physeqf_abs)
+length(unique(taxmat$species))
+length(unique(taxmat$genus))
+length(unique(taxmat$subfamily))
+length(unique(taxmat$famid))
+length(unique(taxmat$order))
+```
+
+# EDFIG2
+## vOTUs
+### PANEL A
+```{r}
+prev <- prevalence_df(physeqf, taxa = T) |> 
+  arrange(desc(prevalence))
+
+otumat <- data.frame(otu_table(physeqf |>  transform_phy("pa")))
+prev <- rowSums(otumat)/nsamples(physeqf); names(prev) <- rownames(otumat)
+
+presabs_votu <- data.frame(t(otumat))  |>  
+  {\(.) pivot_longer(., cols=colnames(.), names_to="OTU", "values_to"="presence")}() |> 
+  mutate(abcno = rep(sample_df(physeqf)$abcno, each=ntaxa(physeqf))) |> 
+  left_join(dplyr::select(sample_df(physeq), abcno, j45_5yr_ever)) |> 
+  mutate(prevalence = prev[OTU],
+         prevalence_cat = cut(prevalence, right=F,
+                              breaks=c(-Inf, 0.01, 0.2, 0.5, Inf))) |> 
+  filter(presence != 0)
+
+# n1, n are used for sorting the graph based on core abundance
+n1 <- presabs_votu |>
+  filter(prevalence_cat == "[0.5, Inf)") |>  
+  dplyr::select(abcno, prevalence) |> 
+  group_by(abcno) |> 
+  summarise(n1 = n())
+n <- presabs_votu |> 
+  group_by(abcno) |> 
+  summarise(nt = n()) |> 
+  left_join(n1) |>  
+  mutate(nx = n1/nt)
+n
+
+# plot
+pl <- presabs_votu |> 
+  left_join(n) |> 
+  ggplot(aes(x=abcno, #fct_reorder(factor(abcno), -nx),
+                fill=factor(prevalence_cat,
+                            levels=rev(c("[-Inf,0.01)", "[0.01,0.2)",
+                                         "[0.2,0.5)", "[0.5, Inf)"))))) +
+  geom_bar(color="black", size=.025, position="fill") +
+  scale_fill_npg(name="") +
+  scale_y_continuous(labels = function(x) paste0(x*100, "%")) +
+  theme(
+    panel.background = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    text = element_text(size = 20)
+    ) +
+  xlab("") + ylab("")
+pl + guides(fill="none")
+
+ggsave("figures/EDFIG2A.pdf", device="pdf", dpi=300, width = 8, height= 4)
+write_tsv(presabs_votu, file="results/core_votu.tsv")
+```
+
+### PANEL B
+```{r}
+xvir <- presabs_votu |> 
+  left_join(dplyr::select(tax_df(physeqf), OTU, virulence) |>  
+              mutate(virulence = case_when(is.na(virulence) ~ "unknown",
+                                           virulence == " 0" ~ "temperate",
+                                           virulence == " 1" ~ "virulent"))) |>
+  filter(virulence != "unknown") |> 
+  group_by(abcno) |> 
+  mutate(nt = n_distinct(OTU)) |> 
+  ungroup() |> 
+  group_by(abcno, prevalence_cat, virulence) |> 
+  mutate(ns = n_distinct(OTU)) |> 
+  ungroup() |> 
+  mutate(n = ns/nt) |>  
+  dplyr::select(abcno, prevalence_cat, virulence, nt, ns, n) |> 
+  unique() 
+  
+# plot
+plsp <- ggplot(xvir, aes(x=prevalence_cat, y=n,
+                fill=virulence)) +
+  geom_point(position=position_jitterdodge(), alpha=.2,
+             aes(color=virulence)) +
+  geom_boxplot(outlier.size = -Inf, alpha=.7, lwd=.3) +
+  scale_color_simpsons() +
+  scale_fill_simpsons() +
+  scale_x_discrete(labels=c("[-Inf,0.01)" = "<1%", "[0.01,0.2)" = "1-19%",
+                            "[0.2,0.5)" = "20-50%", "[0.5, Inf)" = "≥50%")) +
+  scale_y_continuous(labels = function(x) paste0(x*100, "%"), limits=c(0,1)) +
+  theme_minimal(base_size=20) +
+  xlab("Shared") + ylab("Individual proportion") +
+  stat_compare_means(aes(label = paste0("P = ", ..p.format..)),
+                     size=3, label.x.npc="center")
+plsp + guides(fill="none", color="none")
+
+ggsave("figures/EDFIG2B.pdf", device="pdf", dpi=300, height=4, width=6)
+```
+
+## VFCs
+### PANEL C
+```{r}
+physeqf_fam <- physeqf |> 
+  speedyseq::tax_glom("famid")
+taxa_names(physeqf_fam) <- paste0("f_", str_trim(tax_df(physeqf_fam)$famid))
+otumat <- data.frame(otu_table(physeqf_fam |>
+                                 transform_phy("pa")))
+prev <- rowSums(otumat)/nsamples(physeqf_fam); names(prev) <- rownames(otumat)
+
+presabs_vfc <- data.frame(t(otumat)) |>
+  {\(.) pivot_longer(., cols=colnames(.), names_to="OTU", "values_to"="presence")}() |> 
+  mutate(abcno = rep(sample_df(physeqf_fam)$abcno, each=ntaxa(physeqf_fam))) |>
+  left_join(dplyr::select(sample_df(physeqf_fam), abcno, j45_5yr_ever)) |> 
+  mutate(prevalence = prev[OTU],
+         prevalence_cat = cut(prevalence, right=F,
+                              breaks=c(-Inf, 0.01, 0.2, 0.5, Inf))) |> 
+  filter(presence != 0)
+
+# for sorting
+n1 <- presabs_vfc |> 
+  filter(prevalence_cat == "[0.5, Inf)") |> 
+  dplyr::select(abcno, prevalence) |> 
+  group_by(abcno) |> 
+  summarise(n1 = n())
+n <- presabs_vfc |> group_by(abcno) |> 
+  summarise(nt = n()) |> 
+  left_join(n1) |> 
+  mutate(nx = n1/nt)
+n
+
+# plot
+pl <- presabs_vfc |>
+  left_join(n) |>
+  ggplot(aes(x= abcno, #fct_reorder(factor(abcno), -nx),
+                fill=factor(prevalence_cat,
+                            levels=rev(c("[-Inf,0.01)", "[0.01,0.2)",
+                                         "[0.2,0.5)", "[0.5, Inf)"))))) +
+  geom_bar(color="black", size=.025, position="fill") +
+  scale_fill_npg(name="") +
+  scale_y_continuous(labels = function(x) paste0(x*100, "%")) +
+  theme(
+    panel.background = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    text = element_text(size = 20)
+    ) +
+  xlab("") + ylab("")
+pl + guides(fill="none")
+
+ggsave("figures/EDFIG2C.pdf", device="pdf", dpi=300,
+       width=8, height=4)
+write_tsv(presabs_vfc, file="results/core_vfc.tsv")
+```
+
+### PANEL D
+```{r}
+xvir <- presabs_vfc |>
+  mutate(famid = as.numeric(str_replace(OTU, "f_", ""))) |> 
+  left_join(famid_virdf) |>
+  rename(virulence = lifestyle) |> 
+  mutate(virulence = case_when(virulence == "unknown" ~ "unknown",
+                               virulence == "0" ~ "temperate",
+                               virulence == "1" ~ "virulent"))  |> 
+  filter(virulence != "unknown") |> 
+  group_by(abcno) |> 
+  mutate(nt = n_distinct(OTU)) |> 
+  ungroup() |> 
+  group_by(abcno, prevalence_cat, virulence) |> 
+  mutate(ns = n_distinct(OTU)) |> 
+  ungroup() |> 
+  mutate(n = ns/nt) |> 
+  dplyr::select(abcno, prevalence_cat, virulence, nt, ns, n) |> 
+  unique()
+
+
+# plot
+plfam <- ggplot(xvir, aes(x=prevalence_cat, y=n,
+                          fill=virulence)) +
+  geom_point(position=position_jitterdodge(), alpha=.2,
+             aes(color=virulence)) +
+  geom_boxplot(outlier.size = -Inf, alpha=.7, lwd=.3) +
+  scale_color_simpsons() + scale_fill_simpsons() +
+  scale_x_discrete(labels=c("[-Inf,0.01)" = "<1%", "[0.01,0.2)" = "1-19%",
+                            "[0.2,0.5)" = "20-50%", "[0.5, Inf)" = "≥50%")) +
+  scale_y_continuous(labels = function(x) paste0(x*100, "%"), limits=c(0,1)) +
+  theme_minimal(base_size=20) +
+  xlab("Shared") + ylab("Individual proportion") +
+  stat_compare_means(aes(label = paste0("P = ", ..p.format..)),
+                     size=3, label.x.npc = "center")
+plfam + guides(color="none", fill="none")
+
+ggsave("figures/EDFIGD.pdf", device="pdf", dpi=300, height=4, width=6)
+```
+
+# vOTUs by class
+```{r}
+table(taxmat$class)
+paste0(round(table(taxmat$class)/nrow(taxmat)*100), "%")
+```
+
+## FIG1A
+```{r, fig.width=7, fig.height=8}
+e1 <- taxmat |> 
+  dplyr::select(class, order) |> 
+  unique() |> 
+  rename(from = class, to = order)
+e2 <- taxmat |> 
+  dplyr::select(order, famid) |> 
+  unique() |> 
+  rename(from = order, to = famid)
+edges <- rbind(e1, e2)
+# create vertices (node information: name, size, label)
+v1 <- taxmat |> 
+  dplyr::select(class, species) |> 
+  group_by(class) |> summarise(n  = n_distinct(species)) |> 
+  rename(name = class, size = n)
+v2 <- taxmat |> 
+  dplyr::select(order, species) |> 
+  group_by(order) |> summarise(n  = n_distinct(species)) |> 
+  rename(name = order, size = n) |> 
+  mutate(shortName = str_to_sentence(name))
+v3 <- taxmat |> 
+  dplyr::select(famid, species) |> 
+  group_by(famid) |> summarise(n  = n_distinct(species)) |> 
+  rename(name = famid, size = n) 
+vertices <- bind_rows(v1, v2, v3)
+
+# bubble plot
+mygraph <- graph_from_data_frame(edges, vertices=vertices)
+ggraph(mygraph, layout = 'circlepack', weight=size) + 
+  geom_node_circle(aes(fill = depth)) +
+  geom_node_text(aes(label=shortName, fill=depth, size=size)) +
+  theme_void() +
+  theme(legend.position="FALSE") +
+  scale_fill_distiller(palette = "RdPu")
+
+ggsave("figures/FIG1A.pdf", device="pdf", dpi=300, height=9, width=12)
+```
+
+# FIG1B
+```{r}
+ab_class <- abundance_df(speedyseq::tax_glom(physeqf, "class"), sample = T) |> 
+  left_join(tax_df(physeqf)) |> 
+  mutate(class = as.character(class)) |> 
+  mutate(class2 = str_to_sentence(map_class_to_urban[class])) |>
+  mutate(class2 = factor(class2, levels=c("Caudovirus", "Microvirus", "Inovirus")))
+
+ab_class |> 
+  ggplot(aes(x=(class2), y=abundance*100, fill=str_to_sentence(class2))) +
+  geom_boxplot(lwd=.5, outlier.size=Inf) +
+  scale_fill_manual(values=class_color) + guides(fill="none") +
+  xlab("") + ylab("") +
+  ylim(0,100) +
+  theme_pubr(base_size = 18) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggsave("figures/FIG1B.pdf", device="pdf", dpi=300, width=4, height=4)
+```
+
+# FIG1C
+## vOTU
+```{r}
+a <- prevalence_mra_plot(physeqf) + guides(fill="none", color="none") + ylim(0,1)
+```
+
+### EDFIG3
+```{r}
+prevalence_mra_plot(physeqf) + guides(fill="none", color="none") + ylim(0,1) + facet_wrap(~class_urban, nrow=2)
+ggsave("figures/EDFIG3.pdf", width=8, height=5)
+```
+
+## VFC
+```{r}
+b <- prevalence_mra_plot(physeqf |> speedyseq::tax_glom("famid")) + guides(fill="none", color="none")
+```
+
+```{r}
+cowplot::plot_grid(a,b, labels = c("Species", "Families"), nrow=2)
+ggsave("figures/FIG1C.pdf", width=4, height=7)
+```
+
+# Class proportions
+## Microvirus class rel.ab
+```{r}
+ab_class |> filter(class2 == "Microvirus") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+ab_class |> filter(class2 == "Microvirus" & j45_5yr_ever == "1") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+ab_class |> filter(class2 == "Microvirus" & j45_5yr_ever == "0") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+
+# ZSCORE
+ab_class <- ab_class |>
+  group_by(class2) |>
+  mutate(zscore_abundance = as.numeric(scale(abundance)))
+
+# not adjusted with covariates
+tmp <- subset(ab_class, class2 == "Microvirus")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.micro <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T)
+
+
+# adjusted with covariates
+tmp <- subset(ab_class, class2 == "Microvirus" & !is.na(rural_urban))
+fit <- lm(zscore_abundance ~ log(mapDepth) + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.micro.x <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T)
+
+
+fit.micro
+fit.micro.x
+```
+
+## Caudovirus class rel.ab
+```{r}
+ab_class |> filter(class2 == "Caudovirus") |> mutate(abundance = abundance*100) |> pull(abundance) |> summary()
+ab_class |> filter(class2 == "Caudovirus" & j45_5yr_ever == "1") |> mutate(abundance = abundance*100) |> pull(abundance) |> summary()
+ab_class |> filter(class2 == "Caudovirus" & j45_5yr_ever == "0") |> mutate(abundance = abundance*100) |> pull(abundance) |> summary()
+
+ab_class <- ab_class |>
+  group_by(class2) |>
+  mutate(zscore_abundance = as.numeric(scale(abundance)))
+
+# ASSOCIATE
+# not adjusted with covariates
+tmp <- subset(ab_class, class2 == "Caudovirus")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.caudo <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T)
+
+# adjusted with covariates
+tmp <- subset(ab_class, class2 == "Caudovirus" & !is.na(rural_urban))
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.caudox <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T)
+
+
+fit.caudo
+fit.caudox
+```
+
+## Inovirus class rel.ab
+```{r}
+ab_class |> filter(class2 == "Inovirus") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+ab_class |> filter(class2 == "Inovirus") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+ab_class |> filter(class2 == "Inovirus") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+
+ab_class <- ab_class |> 
+  group_by(class2) |>
+  mutate(zscore_abundance = as.numeric(scale(abundance)))
+
+# ASSOCIATE
+# not adjusted with covariates
+tmp <- subset(ab_class, class2 == "Inovirus")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.ino <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T)
+
+
+# adjusted with covariates
+tmp <- subset(ab_class, class2 == "Inovirus" & !is.na(rural_urban))
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.inox <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T)
+
+
+fit.ino
+fit.inox
+```
+
+# FIG1D
+```{r}
+dat_text <- data.frame(
+  label = c(paste0("P = ", roundex(fit.caudo$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.micro$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.ino$p.value[[2]],3))),
+  class   = factor(c("Caudovirus", "Microvirus", "Inovirus"))
+)
+
+ab_class |> 
+  mutate(class = factor(str_to_sentence(class2),
+                        levels=c("Caudovirus", "Microvirus", "Inovirus"))) |> 
+  mutate(asthma = ifelse(j45_5yr_ever == "0", "Healthy", "Asthma")) |> 
+  ggplot(aes(x=asthma, y=abundance)) +
+  geom_point(aes(color=asthma, fill=asthma),
+             pch=21, size=2.5, position=position_jitter(h=0,w=.1)) +
+  geom_boxplot(aes(fill=asthma), outlier.size=-Inf, width=0.5, alpha=.6) +
+  scale_fill_manual(values = color_map2) + scale_color_manual(values =  color_rev_map2) +
+  guides(color="none", fill="none") +
+  scale_fill_manual(values=color_map2) +
+  xlab("") + ylab("Relative abundance") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal(base_size=12) +
+    geom_text(
+  data    = dat_text,
+  mapping = aes(x = "Asthma", y = 1, label = label),
+  hjust   = 0.6,
+  vjust   = 0) +
+  facet_wrap(~class, scales="free")
+
+ggsave("figures/FIG1D.pdf", width=6, height=3)
+```
+
+## EDFIG4
+```{r}
+physeqf.temperate <- subset_taxa(physeqf, virulence == " 0")
+ab_class.temperate <- abundance_df(speedyseq::tax_glom(physeqf.temperate, "class"), sample = T) |> 
+  left_join(tax_df(physeqf.temperate)) |> 
+  mutate(class = as.character(class)) |> 
+  mutate(class2 = str_to_sentence(map_class_to_urban[class])) |>
+  mutate(class2 = factor(class2, levels=c("Caudovirus", "Microvirus", "Inovirus")))
+
+physeqf.virulent <- subset_taxa(physeqf, virulence == " 1")
+ab_class.virulent <- abundance_df(speedyseq::tax_glom(physeqf.virulent, "class"), sample = T) |> 
+  left_join(tax_df(physeqf.virulent)) |> 
+  mutate(class = as.character(class)) |> 
+  mutate(class2 = str_to_sentence(map_class_to_urban[class])) |>
+  mutate(class2 = factor(class2, levels=c("Caudovirus", "Microvirus", "Inovirus")))
+
+physeqf.unknown <- subset_taxa(physeqf, is.na(virulence))
+ab_class.unknown <- abundance_df(speedyseq::tax_glom(physeqf.unknown, "class"), sample = T) |> 
+  left_join(tax_df(physeqf.unknown)) |> 
+  mutate(class = as.character(class)) |> 
+  mutate(class2 = str_to_sentence(map_class_to_urban[class])) |>
+  mutate(class2 = factor(class2, levels=c("Caudovirus", "Microvirus", "Inovirus")))
+
+ab_class.lifestyles <- rbind(
+  ab_class.temperate |> mutate(lifestyle = "temperate") |> 
+    select(abcno, abundance, lifestyle, class2, j45_5yr_ever, mapDepth, age2010, lane, efficiency, propOTU),
+  ab_class.virulent |> mutate(lifestyle = "virulent") |> 
+    select(abcno, abundance, lifestyle, class2, j45_5yr_ever, mapDepth, age2010, lane, efficiency, propOTU),
+  ab_class.unknown |> mutate(lifestyle = "unknown") |> 
+    select(abcno, abundance, lifestyle, class2, j45_5yr_ever, mapDepth, age2010, lane, efficiency, propOTU)
+)
+
+ab_class.lifestyles <- ab_class.lifestyles |> 
+  group_by(class2) |>
+  mutate(zscore_abundance = as.numeric(scale(abundance)))
+
+# ASSOCIATE
+# not adjusted with covariates
+### caudo+temperate
+tmp <- subset(ab_class.lifestyles, class2 == "Caudovirus" & lifestyle == "temperate")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.caudo.temp <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T) # pval = 0.00104
+### caudo+virulent
+tmp <- subset(ab_class.lifestyles, class2 == "Caudovirus" & lifestyle == "virulent")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.caudo.vir <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T) # pval = 0.967
+### caudo+unknown
+tmp <- subset(ab_class.lifestyles, class2 == "Caudovirus" & lifestyle == "unknown")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.caudo.unk <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T) # pval = 0.654
+### micro+unknown
+tmp <- subset(ab_class.lifestyles, class2 == "Microvirus" & lifestyle == "unknown")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.micro.unk <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T) # pval = 0.00786
+### ino+temperate
+tmp <- subset(ab_class.lifestyles, class2 == "Inovirus" & lifestyle == "temperate")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.ino.temperate <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T) # pval = 0.461
+### ino+unknown
+tmp <- subset(ab_class.lifestyles, class2 == "Inovirus" & lifestyle == "unknown")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.ino.unk <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      broom::tidy(exp=TRUE, conf.int=T) # pval = 0.0761
+
+
+dat_text <- data.frame(
+  label = c(paste0("P = ", roundex(fit.caudo.temp$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.caudo.vir$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.caudo.unk$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.micro.unk$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.ino.temperate$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.ino.unk$p.value[[2]],3))),
+  class   = factor(c("Caudovirus", "Caudovirus", "Caudovirus",
+                    "Microvirus", "Inovirus", "Inovirus")),
+  lifestyle = c("Temperate", "Virulent", "Unknown", "Unknown", "Temperate", "Unknown")
+)
+
+
+ab_class.lifestyles |> 
+    mutate(class = factor(str_to_sentence(class2), levels=c("Caudovirus", "Microvirus", "Inovirus")),
+           lifestyle = as.character(str_to_sentence(lifestyle)),
+           lifestyle = factor(lifestyle, 
+                              levels=c("Temperate", "Virulent", "Unknown")),
+           asthma = ifelse(j45_5yr_ever == "0", "Healthy", "Asthma")) |> 
+    ggplot(aes(x=asthma, y=abundance)) +
+      geom_point(aes(fill=lifestyle),
+             pch=21, size=2.5, position=position_jitter(h=0,w=.1),
+             color="white") +
+      geom_boxplot(aes(fill=lifestyle), outlier.size=-Inf, width=0.5, alpha=.6) +
+    facet_grid(class~lifestyle) +
+    guides(color="none", fill="none") +
+    xlab("") + ylab("Relative abundance") +
+    scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+    theme_bw(base_size=12) +
+    geom_text(
+      data    = dat_text,
+      mapping = aes(x = "Asthma", y = 1, label = label),
+      hjust   = 0.6,
+      vjust   = 0)
+
+ggsave(filename = "figures/EDFIG4.pdf",
+       device="pdf", dpi = 300, width=8, height=8)
+```
+
+# Lifestyle proportions
+```{r}
+tmp <- physeqf |> 
+  #subset_taxa(!is.na(virulence)) |> 
+  transform_phy(transform="compositional")
+
+tax_table(tmp) <- tax_df(tmp) |> 
+  mutate(virulence = as.character(virulence),
+         lifestyle = case_when(is.na(virulence) ~ "Unknown", virulence == " 1" ~ "Virulent", virulence == " 0" ~ "Temperate")) |>
+  relocate(lifestyle, .before = category) |> 
+  as.matrix() |> 
+  tax_table()
+
+tmp.agg <- tmp |>
+  speedyseq::tax_glom("lifestyle")
+taxa_names(tmp.agg) <- tax_df(tmp.agg)$lifestyle
+tmp.agg
+
+ab_lifestyle <- abundance_df(tmp.agg, sample = T, id="abcno") |> 
+  left_join(tax_df(tmp.agg)) |> 
+  group_by(tax) |> 
+  mutate(zscore_abundance = as.numeric(scale(abundance)))
+```
+
+## temperate rel.ab
+```{r}
+ab_lifestyle |> filter(tax == "Temperate") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+ab_lifestyle |> filter(tax == "Temperate" & j45_5yr_ever == "1") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+ab_lifestyle |> filter(tax == "Temperate" & j45_5yr_ever == "0") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+
+
+# ASSOCIATE
+# not adjusted with covariates
+tmp <- subset(ab_lifestyle, tax == "Temperate")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.temp <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      tidylog(exp = TRUE, conf.int = TRUE)
+
+# adjusted with covariates
+tmp <- subset(ab_lifestyle, tax == "Temperate" & !is.na(rural_urban))
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.tempx <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      tidylog(exp = TRUE, conf.int = TRUE)
+
+
+fit.temp
+fit.tempx
+```
+
+## virulent rel.ab
+```{r}
+ab_lifestyle |> filter(tax == "Virulent") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+
+
+# ASSOCIATE
+# not adjusted with covariates
+tmp <- subset(ab_lifestyle, tax == "Virulent")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.vir <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      tidylog(exp = TRUE, conf.int = TRUE)
+
+
+# adjusted with covariates
+tmp <- subset(ab_lifestyle, tax == "Virulent" & !is.na(rural_urban))
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.virx <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |> 
+      tidylog(exp = TRUE, conf.int = TRUE)
+
+
+
+fit.vir
+fit.virx
+```
+
+## unknown rel.ab
+```{r}
+ab_lifestyle |> filter(tax == "Unknown") |> mutate(abundance = abundance*100) |>  pull(abundance) |> summary()
+
+
+# ASSOCIATE
+# not adjusted with covariates
+tmp <- subset(ab_lifestyle, tax == "Unknown")
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.unkn <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |>
+      tidylog(exp = TRUE, conf.int = TRUE)
+
+# adjusted with covariates
+tmp <- subset(ab_lifestyle, tax == "Unknown" & !is.na(rural_urban))
+fit <- lm(zscore_abundance ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=tmp)
+tmp$abundance_calibrated <- coef(fit)[1] + resid(fit)
+fit.unknx <- glm(j45_5yr_ever ~ abundance_calibrated,
+        family="binomial",
+        data=tmp) |>
+      tidylog(exp = TRUE, conf.int = TRUE)
+
+
+fit.unkn
+fit.unknx
+```
+
+## FIG1E
+```{r}
+dat_text <- data.frame(
+  label = c(paste0("P = ", roundex(fit.temp$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.vir$p.value[[2]],3)),
+            paste0("P = ", roundex(fit.unkn$p.value[[2]],3))),
+  lifestyle   = factor(c("Temperate", "Virulent", "Unknown")))
+
+ab_lifestyle |> 
+  #filter(lifestyle != "Unknown") |> 
+  mutate(asthma = ifelse(j45_5yr_ever == "0", "Healthy", "Asthma")) |> 
+  mutate(lifestyle = factor(lifestyle, levels = c("Temperate", "Virulent", "Unknown"))) |> 
+  ggplot(aes(x=asthma, y=abundance)) +
+    geom_point(aes(color=asthma, fill=asthma),
+             pch=21, size=2.5, position=position_jitter(h=0,w=.1)) +
+  geom_boxplot(aes(fill=asthma), outlier.size=-Inf, width=0.5, alpha=.6) +
+  scale_fill_manual(values = color_map2) + scale_color_manual(values =  color_rev_map2) +
+  guides(color="none", fill="none") +
+  xlab("") + ylab("Relative abundance") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal(base_size=12) +
+  theme_minimal() +
+  geom_text(
+  data    = dat_text,
+  mapping = aes(x = "Asthma", y = 1, label = label),
+  hjust   = 0.6,
+  vjust   = 0) +
+  facet_wrap(~lifestyle, scales="free")
+
+ggsave("figures/FIG1E.pdf", width=6, height=3)
+```
+
+# Sparsity
+## species level
+```{r}
+df <- otu_df(physeqf)
+paste0(roundex(sum(df == 0)/prod(dim(df)) * 100, 0), "%")
+```
+
+## family level
+```{r}
+df <- otu_df(physeqf_fam)
+paste0(roundex(sum(df == 0)/prod(dim(df)) * 100, 0), "%")
+```
+
+# Alpha diversity: overall, temperate, virulent
+## vOTU
+```{r}
+registerDoParallel(cores=3)
+ixs <- c("all", "virulent", "temperate", "unknown")
+df <- foreach(group = ixs) %dopar% {extract_alpha(physeqf, group)}|>
+  reduce(full_join)
+
+vars <- c("all_observed", "all_shannon",
+          "temperate_observed", "temperate_shannon",
+          "virulent_observed", "virulent_shannon",
+          "unknown_observed", "unknown_shannon")
+print(CreateTableOne(vars = vars, data = df), nonnormal = vars)
+```
+
+## VFC
+```{r}
+registerDoParallel(cores=3)
+ixs <- c("all")
+df_fam <- foreach(group = ixs) %dopar% {extract_alpha(physeqf_fam, group)}|>
+  reduce(full_join)
+
+vars <- c("all_observed", "all_shannon")
+print(CreateTableOne(vars = vars, data = df_fam), nonnormal = vars)
+```
+
+## adjusted for confounders
+```{r}
+df2 <- subset(df, !is.na(rural_urban))
+df2$all_observed_cal <- lm(all_observed ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=df2) |> resid()
+df2$all_shannon_cal <- lm(all_shannon ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=df2) |> resid()
+df2$temperate_observed_cal <- lm(temperate_observed ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=df2) |> resid()
+df2$temperate_shannon_cal <- lm(temperate_shannon ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=df2) |> resid()
+df2$virulent_observed_cal <- lm(virulent_observed ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=df2) |> resid()
+df2$virulent_shannon_cal <- lm(virulent_shannon ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=df2) |> resid()
+df2$unknown_observed_cal <- lm(virulent_observed ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=df2) |> resid()
+df2$unknown_shannon_cal <- lm(virulent_shannon ~ log(mapDepth) + mapDepth + age2010 + lane + efficiency + propOTU + birth_weight + rural_urban + oldchild01, data=df2) |> resid()
+
+fit1x <- glm(j45_5yr_ever ~ all_observed_cal, data=df2, family="binomial") |> tidylog(exp=T, conf.int=T)
+fit2x <- glm(j45_5yr_ever ~ all_shannon_cal, data=df2, family="binomial") |> tidylog(exp=T, conf.int=T)
+fit3x <- glm(j45_5yr_ever ~ temperate_observed_cal, data=df2, family="binomial") |> tidylog(exp=T, conf.int=T)
+fit4x <-glm(j45_5yr_ever ~ temperate_shannon_cal, data=df2, family="binomial") |> tidylog(exp=T, conf.int=T)
+fit5x <- glm(j45_5yr_ever ~ virulent_observed_cal, data=df2, family="binomial") |> tidylog(exp=T, conf.int=T)
+fit6x <- glm(j45_5yr_ever ~ virulent_shannon_cal, data=df2, family="binomial") |> tidylog(exp=T, conf.int=T)
+fit7x <- glm(j45_5yr_ever ~ unknown_observed_cal, data=df2, family="binomial") |> tidylog(exp=T, conf.int=T)
+fit8x <- glm(j45_5yr_ever ~ unknown_shannon_cal, data=df2, family="binomial") |> tidylog(exp=T, conf.int=T)
+fit1x;fit2x;fit3x;fit4x;fit5x;fit6x;fit7x;fit8x
+```
+
+## SFIG1
+```{r, fig.height=8, fig.width=8}
+pl1o <- df |> ggplot(aes(x=j45_5yr_ever, y=all_observed_cal, fill=j45_5yr_ever)) + 
+  geom_point(position=position_jitter(w=0.15,h=0), pch=21, color="white", size=2.5) +
+  geom_boxplot(aes(fill=j45_5yr_ever), lwd=.5, 
+               width=0.5/2,
+               outlier.size=Inf) +
+  scale_fill_manual(values=color_map) + guides(fill="none") +
+  xlab("") + ylab("Richness") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal() +
+  labs(subtitle="All richness", caption=paste0("P = ", roundex(fit1$p.value[[2]],5),
+                                                  "\nP* = ", roundex(fit1x$p.value[[2]],5)))
+
+pl2o <- df |> ggplot(aes(x=j45_5yr_ever, y=temperate_observed_cal, fill=j45_5yr_ever)) + 
+  geom_point(position=position_jitter(w=0.15,h=0), pch=21, color="white", size=2.5) +
+  geom_boxplot(lwd=.5, 
+               width=0.5/2,
+               outlier.size=Inf) +
+  scale_fill_manual(values=color_map) + guides(fill="none") +
+  xlab("") + ylab("Richness") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal() +
+  labs(subtitle="Temperate richness", caption=paste0("P = ", roundex(fit3$p.value[[2]],5),
+                                                  "\nP* = ", roundex(fit3x$p.value[[2]],5)))
+
+pl1s <- df |> ggplot(aes(x=j45_5yr_ever, y=all_shannon_cal, fill=j45_5yr_ever)) + 
+  geom_point(position=position_jitter(w=0.15,h=0), pch=21, color="white", size=2.5) +
+  geom_boxplot(lwd=.5, 
+               width=0.5/2,
+               outlier.size=Inf) +
+  scale_fill_manual(values=color_map) + guides(fill="none") +
+  xlab("") + ylab("Shannon Index") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal() +
+  labs(subtitle="All Shannon", caption=paste0("P = ", roundex(fit2$p.value[[2]],5),
+                                                  "\nP* = ", roundex(fit2x$p.value[[2]],5)))
+
+pl2s <- df |> ggplot(aes(x=j45_5yr_ever, y=temperate_shannon_cal, fill=j45_5yr_ever)) + 
+  geom_point(position=position_jitter(w=0.15,h=0), pch=21, color="white", size=2.5) +
+  geom_boxplot(lwd=.5, 
+               width=0.5/2,
+               outlier.size=Inf) +
+  scale_fill_manual(values=color_map) + guides(fill="none") +
+  xlab("") + ylab("Shannon Index") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal() +
+  labs(subtitle="Temperate Shannon", caption=paste0("P = ", roundex(fit4$p.value[[2]],5),
+                                                  "\nP* = ", roundex(fit4x$p.value[[2]],5)))
+
+pl3o <- df |> ggplot(aes(x=j45_5yr_ever, y=virulent_observed_cal, fill=j45_5yr_ever)) + 
+  geom_point(position=position_jitter(w=0.15,h=0), pch=21, color="white", size=2.5) +
+  geom_boxplot(lwd=.5, 
+               width=0.5/2,
+               outlier.size=Inf) +
+  scale_fill_manual(values=color_map) + guides(fill="none") +
+  xlab("") + ylab("Richness") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal() +
+  labs(subtitle="Virulent richness", caption=paste0("P = ", roundex(fit5$p.value[[2]],5),
+                                                  "\nP* = ", roundex(fit5x$p.value[[2]],5)))
+
+pl3s <- df |> ggplot(aes(x=j45_5yr_ever, y=virulent_shannon_cal, fill=j45_5yr_ever)) + 
+  geom_point(position=position_jitter(w=0.15,h=0), pch=21, color="white", size=2.5) +
+  geom_boxplot(lwd=.5, 
+               width=0.5/2,
+               outlier.size=Inf) +
+  scale_fill_manual(values=color_map) + guides(fill="none") +
+  xlab("") + ylab("Shannon Index") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal() +
+  labs(subtitle="Virulent Shannon", caption=paste0("P = ", roundex(fit6$p.value[[2]],5),
+                                                  "\nP* = ", roundex(fit6x$p.value[[2]],5)))
+
+pl4o <- df |> ggplot(aes(x=j45_5yr_ever, y=unknown_observed_cal, fill=j45_5yr_ever)) + 
+  geom_point(position=position_jitter(w=0.15,h=0), pch=21, color="white", size=2.5) +
+  geom_boxplot(lwd=.5, 
+               width=0.5/2,
+               outlier.size=Inf) +
+  scale_fill_manual(values=color_map) + guides(fill="none") +
+  xlab("") + ylab("Richness") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal() +
+  labs(subtitle="Unknown richness", caption=paste0("P = ", roundex(fit7$p.value[[2]],5),
+                                                  "\nP* = ", roundex(fit7x$p.value[[2]],5)))
+
+pl4s <- df |> ggplot(aes(x=j45_5yr_ever, y=unknown_shannon_cal, fill=j45_5yr_ever)) + 
+  geom_point(position=position_jitter(w=0.15,h=0), pch=21, color="white", size=2.5) +
+  geom_boxplot(lwd=.5, 
+               width=0.5/2,
+               outlier.size=Inf) +
+  scale_fill_manual(values=color_map) + guides(fill="none") +
+  xlab("") + ylab("Shannon Index") +
+  scale_x_discrete(labels=c("0"="Healthy", "1"="Asthma")) +
+  theme_minimal() +
+  labs(subtitle="Unknown Shannon", caption=paste0("P = ", roundex(fit8$p.value[[2]],5),
+                                                  "\nP* = ", roundex(fit8x$p.value[[2]],5)))
+
+cowplot::plot_grid(pl1o, pl2o, pl3o, pl4o, pl1s, pl2s, pl3s, pl4s, ncol=4)
+ggsave("figures/SFIG1.pdf", device="pdf", width=8, height=6, dpi=300)
+```
+
+# session info
+```{r}
+sessionInfo()
+```
+

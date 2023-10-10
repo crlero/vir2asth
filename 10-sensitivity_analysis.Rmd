@@ -1,0 +1,772 @@
+---
+title: "Sensitivity analysis"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+
+# Load packages and data
+```{r}
+source("utils.R")
+library(circlize)
+library(ComplexHeatmap)
+library(microViz)
+library(mediation)
+library(survival)
+library(survminer)
+library(lmtest)
+source("nepisods_trols_glm.R")
+source("GEE_prevalence_score.R")
+
+load("data/vOTUs.processed.RA.RData", verbose = T)
+load("resources/dada2_gtdb_2020_07_13.RData", verbose = T)
+load("resources/J45_diagnosis/J45_cox_cross_220705.rdata", verbose = T)
+load("resources/X.RData", verbose = T)
+gut_score <- readxl::read_excel("resources/gut_scores_1y.xlsx")
+family_host <- read_tsv("resources/fig1.data4.tab")
+core_vfc <- read_tsv("results/core_vfc.tsv") |>
+  mutate(group = case_when(prevalence_cat == "[-Inf,0.02)" ~ "very rare",
+                           prevalence_cat == "[0.02,0.2)" ~ "rare",
+                           prevalence_cat == "[0.2,0.5)" ~ "common",
+                           prevalence_cat == "[0.5, Inf)" ~ "core")) |> 
+  dplyr::select(OTU, prevalence, group) |> 
+  rename(famid = OTU) |> 
+  unique() |> 
+  arrange(desc(prevalence))
+phenodata_all <- X
+physeq
+```
+
+# Preproc virome
+```{r}
+# Remove J45 NAs (no follow-up 5 years)
+physeqf <- subset_samples(physeq, !is.na(j45_5yr_ever))
+physeqf <- subset_taxa(physeqf, taxa_sums(physeqf)>0)
+physeqf
+
+# filter to temperate
+physeqft <- subset_taxa(physeqf, virulence == " 0")
+physeqft
+
+# agglomerate to VFCs
+physeqft_fam <- physeqft |> 
+  speedyseq::tax_glom("famid")
+taxa_names(physeqft_fam) <- paste0("f_", str_trim(tax_df(physeqft_fam)$famid))
+physeqft_fam
+```
+
+# Preproc 16S
+```{r}
+# Remove other timepoints, remove NA asthma
+phy <- subset_samples(phy, sample_data(phy)$Time == "1y")
+phy
+# add sample data
+samdat <- sample_data(phy) |> data.frame() |> rename(abcno = ABCNO) |>
+  mutate(abcno = as.character(abcno)) |> 
+  left_join(J45_cox_cross |> mutate(abcno = as.character(abcno)))
+rownames(samdat) <- sample_names(phy)
+sample_data(phy) <- sample_data(samdat)
+
+# filter to abcno in virome
+phy <- subset_samples(phy, abcno %in% sample_df(physeqf)$abcno)
+sample_names(phy) <- sample_df(phy)$abcno
+
+phy <- prune_taxa(taxa_sums(phy) > 0, phy)
+phy
+
+tax_table(phy) <- tax_df(phy) |> 
+  mutate(Genus = str_replace_all(str_trim(as.character(Genus)), "-", "_")) |> 
+  dplyr::select(-tax) |> 
+  as.matrix()
+
+# Agglomerate to genus
+print("STEP: Agglomerate taxonomic level")
+phy.g <- speedyseq::tax_glom(phy, "Genus")
+taxa_names(phy.g) <- paste0("g_", tax_df(phy.g)$Genus)
+phy.g
+```
+
+# sPLS
+## Subset to temperate core
+```{r}
+keep <- prevalence_df(physeqft_fam) |> filter(prevalence >= 50) |> pull(tax)
+physeq_selected <- subset_taxa(physeqft_fam, taxa_names(physeqft_fam) %in% keep) |> 
+  transform_phy(transform = "compositional") |> 
+   transform_phy(transform = "log")
+
+physeq_selected
+```
+
+## Create data partitions for nested cross-validation
+```{r}
+data <- physeq_selected |>
+  otu_table() |> t() |> data.frame() |> 
+  mutate(Class = as.character(sample_df(physeq_selected)$j45_5yr_ever))
+table(data$Class)
+head(data)[,1:10]
+
+set.seed(11)
+k <- 5 # number of out-cv folds
+f <- createFolds(data$Class, k = k, 
+                 list = TRUE, 
+                 returnTrain = TRUE)
+
+training <- list(); testing <- list()
+for (i in 1:k) {
+  print(paste("Fold: ", i))
+  training.fold <- data[f[[i]],]
+  testing.fold <- data[-f[[i]],]
+  
+  print(table(training.fold$Class))
+  print(table(testing.fold$Class))
+  
+  training[[i]] <- training.fold 
+  testing[[i]] <- testing.fold
+  print("#####################")
+}
+
+
+## check that all test folds from the out-CV, contain all kids
+bind_rows(testing) |> rownames() |> length()
+```
+
+## Inner CV
+Iterate over outer-folds and do a 10-repeat 10-fold CV 
+```{r, fig.width=8, fig.height=4}
+ctrl <- caret::trainControl(method="repeatedcv",
+                            number=10,
+                            repeats=10,
+                            returnResamp = "all",
+                            savePredictions = "all",
+                            allowParallel = T,
+                            verboseIter=TRUE)
+
+registerDoParallel(cores = 3)
+set.seed(111)
+
+splsda_nestedcv <- list(); reps_auc_list <- list();
+max_auc_list <- list(); test_auc_list <- list(); 
+test_preds_list <- list()
+
+for (i in 1:k) {
+  list.keepX = c(seq(2,20,1),
+               seq(20, floor(ncol(training[[i]])/3),20),
+               seq(ceiling(ncol(training[[i]])/3), floor(ncol(training[[i]])/2),25),
+               seq(ceiling(ncol(training[[i]])/2), ncol(training[[i]])-1,30),
+               ncol(training[[i]])-1)
+  list.keepX
+  ncv <- train(as.numeric(Class == "1") ~ .,
+                      data = training[[i]],
+                      method = get_mixOmics_spls(),
+                      preProc = c("center", "scale"),
+                      metric = "Rsquared",
+                      tuneGrid = expand.grid(ncomp = 1,
+                                             keepX = list.keepX, 
+                                             keepY = 1),
+                      trControl = ctrl)
+
+  ## Validation set predictions
+  reps_auc <- ncv |> 
+    get_best_predictions() |> 
+    group_by(Rep) |> 
+    summarize(auc = as.numeric(pROC::auc(obs, pred, direction = "<")))|> 
+    arrange(desc(auc))
+
+  ### get max (best model)
+  max_auc <- reps_auc |> pull(auc) |> max()
+  
+  splsda_nestedcv[[i]] <- ncv
+  reps_auc_list[[i]] <- reps_auc
+  max_auc_list[[i]] <- max_auc
+  
+  ## Test set predictions
+  TestPreds <- predict(ncv, testing[[i]])
+  cvauc.test <- auc(predictor = TestPreds, testing[[i]]$Class, direction = "<")
+  test_preds_list[[i]] <- TestPreds
+  test_auc_list[[i]] <- cvauc.test
+}
+```
+
+### N features selected by fold
+```{r}
+auc_ncv_plots <- list()
+for (i in 1:k) {
+ auc_ncv_plots[[i]] <- auc_components_plot(splsda_nestedcv[[i]] )
+}
+
+cowplot::plot_grid(auc_ncv_plots[[1]] + ggtitle("Fold-1"),
+                   auc_ncv_plots[[2]] + ggtitle("Fold-2"),
+                   auc_ncv_plots[[3]] + ggtitle("Fold-3"),
+                   auc_ncv_plots[[4]] + ggtitle("Fold-4"),
+                   auc_ncv_plots[[5]] + ggtitle("Fold-5"),
+                   ncol=2)
+```
+
+## Outer CV
+Run models with optimised parameters in the entire training partitions of outer folds
+```{r}
+ctrl2 <- caret::trainControl(method="none",
+                            returnResamp = "all",
+                            savePredictions = "all",
+                            allowParallel = T,
+                            verboseIter=TRUE)
+
+set.seed(111)
+out.fit.list <- list(); out.testpreds <- list();
+out.auc <- list()
+keepX <- c(2, 20, 8, 20, 12) # based on visual inspection on previous plots
+for (i in 1:k) {
+  print(keepX[[i]])
+  fit <- train(as.numeric(Class == "1") ~ .,
+                      data = training[[i]],
+                      method = get_mixOmics_spls(),
+                      preProc = c("center", "scale"),
+                      metric = "Rsquared",
+                      tuneGrid = expand.grid(ncomp = 1,
+                                             keepX = keepX[[i]],
+                                             keepY = 1),
+                      trControl = ctrl2, fixX = c(keepX[[i]]))
+
+  out.fit.list[[i]] <- fit
+  testPreds <- predict(fit, testing[[i]])
+  out.testpreds[[i]] <- testPreds
+  out.auc[[i]] <- auc(predictor = testPreds, testing[[i]]$Class, direction = "<")
+}
+
+unlist(out.auc)
+unlist(out.auc) |> mean()
+unlist(out.auc) |> sd()
+```
+## save data
+```{r}
+save(out.auc, 
+     out.testpreds,
+     out.fit.list,
+   file="results/nested_cv.RData")
+```
+
+
+# Loadings interpretation
+```{r}
+taxhost <- tax_df(physeqft) |>
+  dplyr::select(class, famid, family, OTU, hostFamily, hostGenus, tax) |>
+  left_join(make_mradat(physeqft) |>
+              dplyr::select(tax, mra, prevalence)) |>
+  mutate(prevalence = prevalence*100)
+```
+
+# SFIG4
+```{r}
+## biological understanding using a 10-fold CV on all the data yields 19 VFCs (original manuscript)
+load("results/spls_vfc.RData", verbose = TRUE)
+original_loadings <- loadings_df_vfc |> 
+  mutate(cv = "10-fold repeated CV")
+```
+
+## Loadings Outer-CV
+```{r}
+lds.outer <- list()
+for (i in 1:k) {
+   loadings_df_vfc <- out.fit.list[[i]] |>
+    get_loadings("CV", remove_empty = F) |>
+    mutate(cv = paste0("Outer fold-", i)) |> 
+    mutate(famid = var, tax = var) |>
+    left_join(tax_df(physeqft_fam) |>
+                dplyr::select(class, famid, family) |>
+                mutate(famid = paste0("f_", str_trim(famid))) |> unique()) |> 
+    left_join(family_host |> mutate(famid = paste0("f_", str_trim(famid))), by=c("famid")) |> 
+    left_join(make_mradat(physeqft_fam) |> dplyr::select(tax, mra)) |> 
+    left_join(prevalence_df(physeqft_fam) |> dplyr::select(tax, prevalence)) |> 
+    arrange(desc(abs(loading)), desc(sd)) |> 
+    head(out.fit.list[[i]]$bestTune$keepX) |> 
+    dplyr::select(-var, -tax) |> 
+    left_join(core_vfc |> dplyr::select(famid, group)) 
+  lds.outer[[i]] <- loadings_df_vfc 
+}
+
+loadings.outer <- original_loadings |> 
+  bind_rows(lds.outer)
+
+ggplot(loadings.outer |> mutate(f = paste0(family, " (", host, ")")), 
+       aes(fct_reorder(f, prevalence), 
+           loading, ymin = loading - sd, 
+           ymax = loading + sd, fill=host)) +
+  geom_errorbar() +
+  geom_bar(stat = "identity", color="black", lwd=.3) + 
+  coord_flip() + ylab("sPLS loadings") + xlab("VFCs") + 
+  theme_minimal(base_size=10) +
+  ylim(-1, 0.5) + 
+  geom_hline(yintercept=0, linetype=2) +
+  scale_fill_igv() +
+  theme(legend.position = "bottom") +
+  guides(fill="none") +
+  facet_wrap(~ cv, nrow=1)
+
+ggsave("figures/SFIG4.pdf", device="pdf",
+       width=8, height=4)
+```
+
+```{r}
+lds.outer <- bind_rows(lds.outer)
+head(lds.outer)
+
+lds.outer |> 
+  group_by(class, family) |> 
+  summarise(n = n_distinct(cv)) |> 
+  mutate(is_original_loading = ifelse(family %in% original_loadings$family, TRUE, FALSE)) |> 
+  left_join(original_loadings |> select(family, loading, sd)) |> 
+  arrange(desc(n), desc(loading))
+```
+
+## Collect performances
+```{r}
+df <- data.frame(validation_best = unlist(max_auc_list),
+                  test = unlist(out.auc))
+df
+mean(df$validation_best)
+mean(df$test)
+```
+
+
+# NCV Virome scores
+```{r, fig.width=6, fig.height=3}
+vir_score <- unlist(out.testpreds)
+
+virome_pls_score_vfc <- data.frame(abcno = names(vir_score),
+                               pls_score = vir_score) |>
+  left_join(dplyr::select(sample_df(physeqft), abcno, j45_5yr_ever, asthma_mother))
+
+# ZSCORE - normalize the PLS score (scale and center)
+virome_pls_score_vfc <- virome_pls_score_vfc |>
+  mutate(zscore_vir_pls_score = as.numeric(scale(pls_score))) |> 
+  rename(vir_pls_score = pls_score)
+```
+
+## NCV Virome score vs. asthma
+```{r,fig.width=4, fig.height=3}
+glm(j45_5yr_ever ~ zscore_vir_pls_score,
+    data=virome_pls_score_vfc, family="binomial") |>
+  tidylog(exp=T, conf.int = T)
+```
+
+# 16S scores (Stokholm et al.)
+```{r}
+gut_scores <- sample_df(physeqf) |> 
+  dplyr::select(abcno, j45_5yr_ever) |> 
+  left_join(gut_score |>
+              mutate(abcno = as.character(abcno))) |> 
+  dplyr::rename(bac_pls_score = j45_cross_pls_1y_all) |> 
+  mutate(zscore_bac_pls_score = as.numeric(scale(bac_pls_score)))
+head(gut_scores)
+```
+
+## 16S scores vs. asthma
+```{r}
+glm(j45_5yr_ever ~ zscore_bac_pls_score,
+    data=gut_scores, family="binomial") |>
+  tidylog(exp=T, conf.int = T)
+```
+
+```{r}
+copdat_scores <- virome_pls_score_vfc |> 
+  left_join(gut_scores) |> 
+  filter(!is.na(bac_pls_score))
+head(copdat_scores)
+write_tsv(virome_pls_score_vfc, file="results/virome_scores_ncv.tsv")
+write_tsv(copdat_scores, file="results/virome_bac_scores_ncv.tsv")
+```
+
+## EDFIG8A
+```{r, fig.height=3.5, fig.width=5}
+copdat_scores |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score*asthma_mother, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+```
+
+```{r}
+# asthma_mother == 1
+fit.1 <- copdat_scores |> 
+  filter(asthma_mother == 1) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+fit.1
+
+# asthma_mother == 0
+fit.2 <- copdat_scores |> 
+  filter(asthma_mother == 0) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+fit.2
+```
+
+```{r}
+# asthma_mother == 1
+fit.1x <- copdat_scores |> 
+  filter(asthma_mother == 1) |> 
+  glm(j45_5yr_ever ~ zscore_bac_pls_score, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+fit.1x
+
+# asthma_mother == 0
+fit.2x <- copdat_scores |> 
+  filter(asthma_mother == 0) |> 
+  glm(j45_5yr_ever ~ zscore_bac_pls_score, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+fit.2x
+```
+
+```{r}
+df <- fit.2 |> 
+  mutate(outcome = "asthma",
+         group = "Non-asthmatic mother",
+         data = "Virome") |> 
+  bind_rows(fit.1 |> 
+              mutate(outcome = "asthma",
+                     group = "Asthmatic mother",
+                     data = "Virome")) |> 
+  bind_rows(fit.2x |> 
+              mutate(outcome = "asthma",
+                     group = "Non-asthmatic mother",
+                     data = "16S")) |> 
+  bind_rows(fit.1x |> 
+              mutate(outcome = "asthma",
+                     group = "Asthmatic mother",
+                     data = "16S")) |> 
+  filter(term != "(Intercept)") |> 
+  dplyr::select(outcome, estimate, conf.low, conf.high, p.value, group, data)
+
+df |> 
+  ggplot(aes(x=data, y=estimate, color=group)) +
+    geom_hline(yintercept=1, linetype=2, lwd=.2) +
+    geom_point(position=position_dodge(width=0.2)) +
+    geom_linerange(aes(xend=data, ymin=conf.low, ymax=conf.high),
+                 position=position_dodge(width=0.2)) +
+    coord_flip() +
+    xlab("") + ylab("OR") +
+    scale_color_colorblind() +
+    #guides(color="none") +
+    theme_pubr(base_size=12)
+ggsave("figures/EDFIG8A.pdf", device="pdf", dpi=300,
+       width=3, height=2.5)
+```
+
+# EDFIG8B
+## NCV virome
+```{r}
+mygee(copdat_scores, "zscore_vir_pls_score", 5) + theme_pubr(base_size=10)
+ggsave("figures/EDFIG8Bvir.pdf", device="pdf", dpi=300,
+       width=4, height=3.5)
+```
+
+# Mediation analysis
+### step 1: Y \~ X
+```{r}
+model.1 <- copdat_scores |>
+              glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_,
+                  family="binomial")
+                  
+model.1 |> tidylog(conf.int=T, exp=T)
+```
+
+### step 2: M ~ X
+```{r}
+model.M <- copdat_scores |>
+  lm(zscore_bac_pls_score ~ zscore_vir_pls_score,
+     data=_)
+
+tidylog(model.M, conf.int = T)
+```
+
+### step 3: Y \~ X + M
+```{r}
+model.Y <- copdat_scores |>
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  lm(asthma ~ zscore_vir_pls_score + zscore_bac_pls_score,
+               data = _)
+
+model.Y |> tidylog(conf.int = T, exp=T)
+```
+
+### step 4: mediation
+```{r, fig.width=3, fig.height=4}
+set.seed(11)
+mediation_results <- mediation::mediate(model.M, model.Y,
+                   treat='zscore_vir_pls_score',
+                   mediator='zscore_bac_pls_score',
+                   control.value=0, treat.value =1,
+                   boot=TRUE, sims=1000)
+summary(mediation_results)
+```
+
+### EDFIG8C
+```{r}
+data.frame(term = factor(c("Causal\nmediation effect\n (Virome through 16S)", "Direct effect\n(Virome)", "Total effect\n(Virome + 16S)"),
+                         levels=c("Total effect\n(Virome + 16S)", "Direct effect\n(Virome)", "Causal\nmediation effect\n (Virome through 16S)")),
+           estimate = c(0.01132, 0.03831, 0.04963),
+           conf.low = c(0.00115, 0.00481, 0.01833),
+           conf.high = c(0.02, 0.07, 0.08),
+           group = factor(c(rep("Average", 3)),
+                          levels=c("Average"))) |> 
+  ggplot(aes(x=term, y=estimate)) +
+  geom_point(aes(color=group), position=position_dodge(width=0.2)) +
+  geom_linerange(aes(x=term, ymin=conf.low, ymax=conf.high, color=group),
+                 position=position_dodge(width=0.2)) +
+  coord_flip() +
+  geom_hline(yintercept=0, linetype=2) +
+  scale_color_manual(values=c(color_map2, c("Average" = "black"))) +
+  xlab("") + ylab("Estimate") +
+  theme_pubr(base_size=10) +
+  guides(color="none")
+
+ggsave("NM-02/NMR1_figures/forest_mediation.pdf", width=4, height=2.5)  
+```
+
+## moderator: asthma-mother
+### step 2: M \~ X
+```{r}
+model.M <- copdat_scores |>
+  lm(zscore_bac_pls_score ~ zscore_vir_pls_score*asthma_mother,
+     data=_)
+
+tidylog(model.M, conf.int = T)
+```
+
+### step 3: Y \~ X + M
+```{r}
+model.Y <- copdat_scores |>
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  lm(asthma ~ zscore_vir_pls_score*asthma_mother + zscore_bac_pls_score*asthma_mother,
+               data =_)
+
+model.Y |> tidylog(conf.int = T, exp=T)
+```
+
+### step 4: mediation
+```{r, fig.width=3, fig.height=4}
+set.seed(11)
+mediation_results_mod <- mediation::mediate(model.M, model.Y,
+                   treat='zscore_vir_pls_score',
+                   mediator='zscore_bac_pls_score',
+                   boot=TRUE, sims=10)
+test.modmed(mediation_results_mod,
+            covariates.1 = list(asthma_mother = 1),
+            covariates.2 = list(asthma_mother = 0),
+            sims=1000)
+```
+
+# EDFIG8D
+```{r}
+surv_data <- copdat_scores |> 
+  mutate(abcno = as.character(abcno)) |> 
+  mutate(vir_score_group = as.numeric(gtools::quantcut(zscore_vir_pls_score, q = 2))-1,
+         bac_score_group = as.numeric(gtools::quantcut(zscore_bac_pls_score, q = 2))-1) |> 
+  mutate(signature_group = case_when(bac_score_group == 1 & vir_score_group == 1 ~ "bac-H & vir-H",
+                                     bac_score_group == 1 & vir_score_group == 0 ~ "bac-H & vir-L",
+                                     bac_score_group == 0 & vir_score_group == 0 ~ "bac-L & vir-L",
+                                     bac_score_group == 0 & vir_score_group == 1 ~ "bac-L & vir-H"),
+         siganture_group = as.factor(signature_group),
+         signature_scale3g = case_when(signature_group == "bac-L & vir-L" ~ 1,
+                                     signature_group %in% c("bac-H & vir-L", "bac-L & vir-H") ~ 2,
+                                     signature_group == "bac-H & vir-H" ~ 3),
+         signature_scale4g = case_when(signature_group == "bac-L & vir-L" ~ 1,
+                                     signature_group == "bac-H & vir-L" ~ 2,
+                                     signature_group == "bac-L & vir-H" ~ 3,
+                                     signature_group == "bac-H & vir-H" ~ 4)) |> 
+  dplyr::select(abcno, zscore_vir_pls_score, zscore_bac_pls_score, vir_score_group, bac_score_group, signature_group, signature_scale3g, signature_scale4g, j45_5yr_ever, asthma_mother) |> 
+  left_join(phenodata_all |> mutate(abcno = as.character(abcno)) |> dplyr::select(abcno, eventage_j45_5yr, event_j45_5yr))
+head(surv_data)
+```
+
+```{r}
+table(surv_data$signature_group)
+```
+
+```{r}
+km_fit <- survfit(Surv(eventage_j45_5yr, event_j45_5yr == 1) ~ signature_group, data=surv_data)
+summary(km_fit)
+pl <- ggsurvplot(km_fit, fun = "event", conf.int=F,
+           #conf.int.style = "step",  # customize style of confidence intervals
+           xlab = "Time in days",
+           break.time.by = 365.25,
+           ggtheme = theme_pubr(),
+           #risk.table = "abs_pct",
+           pval = T)
+pl
+pdf("figures/EDFIG8D.pdf",
+        width=5, height=5)
+print(pl, newpage=F)
+dev.off()
+```
+
+## Cox regression
+```{r}
+cox_4g <- coxph(Surv(eventage_j45_5yr, event_j45_5yr == 1) ~ signature_scale4g, data=surv_data)
+broom::tidy(cox_4g, exp=T, conf.int=T)
+```
+
+```{r}
+cox_3g <- coxph(Surv(eventage_j45_5yr, event_j45_5yr == 1) ~ signature_scale3g, data=surv_data)
+broom::tidy(cox_3g, exp=T, conf.int=T)
+```
+
+# NCV virome score ~ TLR9
+```{r}
+# dominant model
+virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |> 
+  mutate(score = as.factor(as.numeric(quantcut(zscore_vir_pls_score, q = 2))-1)) |>
+  filter(!is.na(tlr9_rs187084_G)) |>
+  mutate(tlr9 = case_when(tlr9_rs187084_G == 0 ~ 1,
+                      tlr9_rs187084_G == 1 ~ 1,
+                      tlr9_rs187084_G == 2 ~ 0)) |>
+  lm(zscore_vir_pls_score ~ tlr9, data=_) |> 
+  tidylog(conf.int=T)
+```
+
+# asthma ~ TLR9
+```{r}
+# dominant model
+virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |> 
+  mutate(score = as.factor(as.numeric(quantcut(zscore_vir_pls_score, q = 2))-1)) |>
+  filter(!is.na(tlr9_rs187084_G)) |>
+  mutate(tlr9 = case_when(tlr9_rs187084_G == 0 ~ 1,
+                        tlr9_rs187084_G == 1 ~ 1,
+                        tlr9_rs187084_G == 2 ~ 0)) |>
+  glm(j45_5yr_ever ~ tlr9, data=_, family="binomial") |>
+  tidylog(exp=T, conf.int=T)
+```
+
+# asthma ~ NCV virome score + TLR9
+```{r}
+# dominant model
+m0.dom <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> 
+              dplyr::select(abcno, tlr9_rs187084_G) |> 
+              mutate(abcno = as.character(abcno))) |> 
+  mutate(score = as.factor(as.numeric(quantcut(zscore_vir_pls_score, q = 2))-1)) |>
+  filter(!is.na(tlr9_rs187084_G)) |>
+  mutate(tlr9 = case_when(tlr9_rs187084_G == 0 ~ 1,
+                          tlr9_rs187084_G == 1 ~ 1,
+                          tlr9_rs187084_G == 2 ~ 0)) |>
+  glm(j45_5yr_ever ~ zscore_vir_pls_score + tlr9, data=_, family="binomial")
+
+tidylog(m0.dom, exp=T, conf.int=T)
+```
+
+# asthma ~ NCV virome score + TLR9 + asthma*TLR9
+```{r}
+# dominant model
+m1.dom <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |>
+  mutate(tlr9 = case_when(tlr9_rs187084_G == 0 ~ 1,
+                          tlr9_rs187084_G == 1 ~ 1,
+                          tlr9_rs187084_G == 2 ~ 0)) |> 
+  mutate(score = as.factor(as.numeric(quantcut(zscore_vir_pls_score, q = 2))-1)) |>
+  glm(j45_5yr_ever ~ zscore_vir_pls_score*tlr9, data=_, family="binomial") 
+
+tidylog(m1.dom, exp=T, conf.int=T)
+```
+
+## LRT
+```{r}
+lrtest(m0.dom, m1.dom)
+```
+
+## EDFIG8F
+```{r}
+m1_aa <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |>
+  filter(tlr9_rs187084_G == 0) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family="binomial") 
+
+tidylog(m1_aa, exp=T, conf.int=T)
+
+m1_ag <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |>
+  filter(tlr9_rs187084_G == 1) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family="binomial") 
+
+tidylog(m1_ag, exp=T, conf.int=T)
+
+m1_gg <- virome_pls_score_vfc |> 
+  mutate(abcno = as.character(abcno), j45_5yr_ever = as.factor(j45_5yr_ever)) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, tlr9_rs187084_G) |> mutate(abcno = as.character(abcno))) |>
+  filter(tlr9_rs187084_G == 2) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family="binomial") 
+
+tidylog(m1_gg, exp=T, conf.int=T)
+```
+
+```{r}
+data.frame(term = factor(c("AA", "AG", "GG"),
+                         levels=c("AA", "AG", "GG")),
+           estimate = c(1.4072178, 1.4072178, 0.6126870),
+           conf.low = c(0.9679178, 1.0370917, 0.3189059),
+           conf.high = c(1.9694150, 1.9217003, 1.0927735)) |> 
+  ggplot(aes(x=term, y=estimate)) +
+  geom_point(position=position_dodge(width=0.2)) +
+  geom_linerange(aes(x=term, ymin=conf.low, ymax=conf.high),
+                 position=position_dodge(width=0.2)) +
+  xlab("") + ylab("Estimate") +
+  geom_hline(yintercept=1, linetype=2, lwd=0.25) +
+  theme_pubr(base_size = 12) +
+  ylab("OR")
+ggsave("figures/EDFIG8F.pdf", device="pdf", width=3, height=2.5)
+```
+
+
+# EDFIG8E
+```{r}
+m0 <- copdat_scores |>
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  glm(j45_5yr_ever ~ 1, data=_, family="binomial")
+
+m1 <- copdat_scores |> 
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family="binomial")
+
+m2 <- copdat_scores |> 
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  glm(j45_5yr_ever ~ zscore_vir_pls_score + zscore_bac_pls_score, data=_, family="binomial")
+
+m3 <- copdat_scores |> 
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  glm(j45_5yr_ever ~ zscore_bac_pls_score, data=_, family="binomial")
+
+lrtest(m1, m2) # vir vs. vir + bac
+lrtest(m3, m2) # bac vs. vir + bac
+```
+
+```{r}
+fit.vir <- glm(j45_5yr_ever ~ zscore_vir_pls_score, data=copdat_scores, family="binomial")
+fit.bac <- glm(j45_5yr_ever ~ zscore_bac_pls_score, data=copdat_scores, family="binomial")
+fit.vir_bac <- glm(j45_5yr_ever ~ zscore_vir_pls_score + zscore_bac_pls_score, data=copdat_scores, family="binomial")
+
+r2.vir <- r2(fit.vir)
+r2.bac <- r2(fit.bac)
+r2.vir_bac <- r2(fit.vir_bac)
+
+df <- data.frame(r2 = c(as.numeric(r2.vir), as.numeric(r2.bac), as.numeric(r2.vir_bac)), group=c("Virome", "16S", "Virome + 16S"))
+ggplot(df, aes(x=group, y=r2*100, fill=group)) +
+  geom_col() + 
+  theme_pubr(base_size=10) +
+  xlab("") +
+  guides(fill="none")
+ggsave("figures/EDFIG8E.pdf", device="pdf", width=2, height=2)  
+```
+
+# session info
+```{r}
+sessionInfo()
+```

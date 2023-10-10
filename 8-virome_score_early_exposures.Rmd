@@ -1,0 +1,121 @@
+---
+title: "Virome scores and early life exposures"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+# Load packages and data
+```{r}
+source("utils.R")
+library(gtools)
+load("resources/X.RData", verbose = T)
+phenodata_all <- X
+virome_pls_score_vfc <- read_tsv("results/virome_scores.tsv")
+```
+
+# Score associations
+```{r}
+exposures <- c(
+  "ab_child_1yr_ever", 
+  "abbirth",
+  "oldchild01",
+  "rural_urban",
+  "mother_bmi",
+  "motherage",
+  'asthma_mother',
+  'asthma_father',
+  "delivery",
+  "cat_birth",
+  "dog_birth",
+  "breast_exclusive",
+  "fishoil",
+  "dvit",
+  "birth_weight",
+  "birthseason"
+  )
+```
+
+```{r}
+phenodata_all$birthseason <- factor(phenodata_all$birthseason,
+                                    levels = c("winter", "spring", "summer", "autumn"))
+phenodata_all$delivery <- factor(phenodata_all$delivery,
+                                 levels = c("Normal", "Acute sectio", "Planned sectio"))
+set.seed(1)
+registerDoParallel(cores=3)
+pls_exposures_lm <- foreach(var=exposures, .combine=bind_rows, .errorhandling = "remove") %dopar% {
+  f <- as.formula(paste0("zscore_vir_pls_score ~ ", var))
+  fit <- virome_pls_score_vfc |> 
+    mutate(abcno = as.character(abcno)) |> 
+    left_join(phenodata_all[,c("abcno", var)] |>
+                mutate(abcno = as.character(abcno))) |> 
+    lm(f, data=_)
+  fit |> 
+    tidylog(conf.int=T) |> 
+    filter(term != "(Intercept)") |> 
+    mutate(r2 = as.numeric(performance::r2(fit)$R2),
+           exposure = var)
+}
+
+pls_exposures_lm <- pls_exposures_lm |> 
+  arrange(p.value) |> 
+  mutate(p.adjust = p.adjust(p.value, method="fdr"))
+pls_exposures_lm |> 
+  arrange(p.value, desc(r2)) |> 
+  dplyr::select(term, estimate, conf.low, conf.high, p.value, r2)
+```
+
+## adjusted
+```{r}
+df <- virome_pls_score_vfc |> 
+  left_join(phenodata_all) |> 
+  filter(!is.na(fishoil))
+
+# calibrate
+df$calibrated <- resid(lm(zscore_vir_pls_score ~ oldchild01 + cat_birth + birth_weight + motherage + birthseason + fishoil + delivery, data=df)) + median(df$zscore_vir_pls_score)
+
+# logreg
+glm(j45_5yr_ever ~ calibrated, data=df, family="binomial") |> 
+  tidylog(exp=T, conf.int=T)
+```
+
+# FIG6
+```{r}
+dat <- pls_exposures_lm |> 
+  dplyr::select(term, estimate, std.error, conf.low, conf.high, p.value, n, n_missing, r2) |>
+  dplyr::rename(Exposure = term)
+
+dat$r2 <- round(as.numeric(dat$r2)*100, 2)
+dat$`Estimate` <- paste(rep(" ", 20), collapse = " ")
+dat$`Estimate (95% CI)` <- sprintf("%.2f (%.2f to %.2f)", as.numeric(dat$estimate), as.numeric(dat$conf.low), as.numeric(dat$conf.high))
+dat$`P-value` <- paste0(sprintf("%.2f", as.numeric(dat$p.value)), stars.pval(as.numeric(dat$p.value)))
+dat$`FDR\nP-value` <- paste0(sprintf("%.2f", p.adjust(as.numeric(dat$p.value), method="fdr")), stars.pval(p.adjust(as.numeric(dat$p.value), method="fdr")))
+dat$`P-value` <- ifelse(is.na(dat$`P-value`), "", dat$`P-value`)
+dat <- dat |> arrange(desc(r2),desc(Exposure))
+tm <- forest_theme(base_size = 10,
+                   footnote_col = "#636363")
+dat$nn <- 0
+
+pl <- forestploter::forest(dat[,c(1, 14, 7, 10:9, 12)],
+          est = dat$estimate,
+          lower = dat$conf.low, 
+          upper = dat$conf.high,
+          sizes = 0.5,
+          ci_column = 4,
+          ref_line = 0,
+          arrow_lab = c("Lower score", "Higher score"),
+          xlim = c(-0.6, 0.6),
+          footnote = "Univariate linear regressions",
+          theme = tm)
+
+ggsave(plot=pl, filename = "figures/FIG6.pdf", device="pdf", dpi=300,
+       width=6, height=6)
+```
+
+# session info
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,73 @@
+---
+title: "Calculate Beta-diversities"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+# Packages and libraries
+```{r}
+source("utils.R")
+```
+
+# Input files
+```{r}
+phylo_file <- "data/vOTUs.processed.RA.RData"
+```
+
+# Output files
+```{r}
+outfile <- "results/STABLE2.tsv"
+```
+
+# Load phyloseq and distances
+```{r}
+load(phylo_file, verbose = T)
+```
+
+```{r}
+pheno <- "j45_5yr_ever"
+sample_data(physeq)$mapDepth_log <- log(sample_data(physeq)$mapDepth)
+  
+# pre-computed distance files
+dirlist <- list.files("data", full.names = T)
+dirlist <- dirlist[grepl("distance_", dirlist)]
+
+# compute PERMANOVA adjusting for batch variables
+resdf <- list()
+for (distance in dirlist) {
+  print(paste0("Processing: ", distance))
+  dist <- readRDS(distance)[[1]]
+  tax <- str_split(str_split(distance, "/")[[1]][2], "_")[[1]][2]
+  virclass <- str_split(str_split(distance, "/")[[1]][2], "_")[[1]][3]
+  method <- str_split(str_split(distance, "/")[[1]][2], "_")[[1]][4] |> 
+    str_replace(".rds", "")
+  res <- myadonis(dist = dist,
+    phy = physeq,
+    var = pheno,
+    block = "lane",
+    covars = c("mapDepth", "mapDepth_log", "propOTU", "efficiency"),
+    nproc = 3) |> 
+    filter(variable == pheno) |> 
+    mutate(tax = tax,
+           virclass = virclass,
+           method = method)
+  resdf[[distance]] <- res
+}
+
+results <- bind_rows(resdf) |> 
+  arrange(tax, pval)
+
+print("Significant results")
+print(subset(results, pval <= 0.05))
+
+write_tsv(results, outfile)
+```
+
+# sessionInfo
+```{r}
+sessionInfo()
+```

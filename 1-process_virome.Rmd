@@ -1,0 +1,121 @@
+---
+title: "Process virome"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+# Packages and libraries
+```{r}
+source("utils.R")
+```
+
+# Input files
+```{r}
+phyloseq_relative_abundance <- "resources/vOTUs.g.viruses.RData"
+j45_cox_10yr_file <- "resources/J45_diagnosis/J45_cox_cross_220705.rdata"
+sample_data <- "resources/X.RData"
+tlr9_genotype_data <- "resources/COPSAC_2010_HRC1.1_Sanger_genotypes.tsv"
+```
+
+# Output files
+```{r}
+out_phyloseq_relative_abundance <- "data/vOTUs.processed.RA.RData"
+```
+
+# Load virome dataset
+```{r}
+load(phyloseq_relative_abundance, verbose = T)
+assign("physeq", vOTUs.g.viruses); rm(vOTUs.g.viruses)
+print(physeq)
+sample_names(physeq) <- sample_df(physeq)$abc
+```
+
+# Sample data
+```{r}
+virdat <- sample_df(physeq) %>%
+  rename(abcno = abc) %>%
+  mutate(abcno = as.character(abcno)) %>%
+  dplyr::select(abcno, batch, lane, fie, seqDepth, qcDepth, mapDepth,
+                mapQcDepth, OTUdepth, propViral, propOTU,
+                finalEfficiency, propBacterial, viromeQC, VLPs, sampleId,
+                RsampleId, viromeExtractBatch, sampleDate, age, age2010)  %>%
+  mutate(efficiency = OTUdepth / qcDepth) %>%
+  relocate(efficiency, .before = finalEfficiency)
+```
+
+## Add asthma diagnosis
+```{r}
+load(j45_cox_10yr_file, verbose = T)
+phenodat <- J45_cox_cross %>%
+  mutate(abcno = as.character(abcno)) %>%
+  dplyr::select(abcno, j45_5yr_ever) %>%
+  mutate(j45_5yr_ever = as.factor(j45_5yr_ever))
+```
+
+## Add exposure data
+```{r}
+load(sample_data)
+sampledat <- X %>%
+  dplyr::select(abcno, sex, race, birthseason, birthdate, motherage,
+                fishoil, dvit, hospitalizedbirth,
+                oldchild01, breast_exclusive, delivery,
+                delivery, cat_birth, dog_birth, catordog,
+                birth_weight, abbirth_mother, abbirth_child, abbirth, ab_preg_yn, first_yn,
+                mother_bmi, preeclampsy, rural_urban, asthma_father, asthma_mother,
+                n_episodes, n_episodes_year_1, n_episodes_year_2, n_episodes_year_3) %>% 
+  mutate(abcno = as.character(abcno))
+rm(X); head(sampledat)
+```
+
+## Add TLR9 genotype data
+```{r}
+tlr9_genotypes <- read_tsv(tlr9_genotype_data) %>% 
+  dplyr::rename(abcno = ID, tlr9_rs187084_G = rs187084_G) %>% 
+  mutate(abcno = as.character(abcno))
+```
+
+## Put all stuff together
+```{r}
+df <- virdat %>%
+  left_join(., phenodat) %>% 
+  left_join(., sampledat) %>% 
+  left_join(., tlr9_genotypes) %>% 
+  magrittr::set_rownames(.$abcno) %>% 
+  mutate_at(.vars = c("viromeExtractBatch", "lane", "sex", "birthseason",
+                      "fishoil", "dvit", "hospitalizedbirth", "lane", "fie", "batch",
+                      "oldchild01", "delivery", "preeclampsy", "cat_birth", "dog_birth",
+                      "catordog", "abbirth_mother", "abbirth_child", "abbirth", "ab_preg_yn",
+                      "mother_bmi", "rural_urban", "asthma_father", "asthma_mother", 
+                      "j45_5yr_ever"),
+            .funs = as.factor)
+print(head(df))
+```
+
+# Process relative abundance
+```{r}
+# Add sample/pheno data
+sample_data(physeq) <- df
+# Remove noise: Assinging 0 to counts <= 1e-9
+otumat_rel <- physeq %>% otu_table()
+otumat_rel[otumat_rel <= 1e-09] <- 0
+otu_table(physeq) <- otu_table(otumat_rel, taxa_are_rows = TRUE)
+# Filter to bacteriophages
+physeq <- subset_taxa(physeq,
+                      class %in% c("Faserviricetes",
+                                   "Malgrandaviricetes",
+                                   "Caudoviricetes"))
+print(physeq)
+# Re-normalize counts (TSS)
+physeq <- transform_phy(physeq, transform = "compositional")
+# Saving output - relative abundances - phyloseq
+save(physeq, file = out_phyloseq_relative_abundance)
+```
+
+# sessionInfo
+```{r}
+sessionInfo()
+```

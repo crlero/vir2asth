@@ -1,0 +1,67 @@
+---
+title: "Calculate distances"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+# Packages and libraries
+```{r}
+source("utils.R")
+```
+
+# Input files
+```{r}
+phylo_file <- "data/vOTUs.processed.RA.RData"
+```
+
+# Load phyloseq
+```{r}
+load(phylo_file, verbose = TRUE)
+physeq
+```
+
+# Subset dataset: overall, temperate, virulent, unknown
+```{r}
+virclass <- c("all", "temperate", "unknown", "virulent")
+distances <- c("unifrac", "wunifrac", 
+               "canberra", "euclidean", # euclidean = aitchison (with clr-transform)
+               "jaccard")
+```
+
+# vOTU
+```{r}
+tax <- "species"
+for (vir in virclass) {
+  for (d in distances) {
+    (sps <- subset_lifestyle(physeq, vir))
+    (sps <- speedyseq::tax_glom(sps, tax))
+    sps <- transform_phy(sps, transform = "compositional") # re-normalize
+    calculate_distance(sps, threads = 3, midistance = d, 
+                      outfile = paste0("data/distance_", tax, "_", vir, "_", midistance, ".rds"))
+  }
+}
+```
+
+# VFC
+```{r}
+tax <- "famid"
+for (vir in virclass) {
+  for (d in distances) {
+    (sps <- subset_lifestyle(physeq, vir))
+    (sps <- speedyseq::tax_glom(sps, tax))
+    sps <- transform_phy(sps, transform = "compositional") # re-normalize
+    calculate_distance(sps, threads = 3, midistance = d, 
+                      outfile = paste0("data/distance_", tax, "_", vir, "_", midistance, ".rds"))
+  }
+}
+```
+
+# sessionInfo
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,627 @@
+---
+title: "Temperate virome vs Bacteriome"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+# Load packages and data
+
+```{r}
+source("utils.R")
+library(mediation)
+library(survival)
+library(survminer)
+library(microViz)
+library(lmtest)
+source("GEE_prevalence_score.R")
+
+load("data/vOTUs.processed.RA.RData", verbose = T)
+load("resources/dada2_gtdb_2020_07_13.RData", verbose = T)
+load("resources/J45_diagnosis/J45_cox_cross_220705.rdata", verbose = T)
+load("resources/X.RData", verbose = T)
+copdat_scores <- read_tsv("results/virome_bac_scores.tsv")
+vir_scores <- read_tsv("results/virome_scores.tsv")
+phenodata_all <- X
+physeq
+```
+
+# Preproc virome
+```{r}
+# Remove J45 NAs (no follow-up 5 years)
+physeqf <- subset_samples(physeq, !is.na(j45_5yr_ever))
+physeqf <- subset_taxa(physeqf, taxa_sums(physeqf)>0)
+physeqf
+
+# filter to temperate
+physeqft <- subset_taxa(physeqf, virulence == " 0") #|> 
+  #transform_phy(., transform="compositional")
+physeqft
+
+# agglomerate to VFCs
+physeqft_fam <- physeqft |> 
+  speedyseq::tax_glom("famid")
+taxa_names(physeqft_fam) <- paste0("f_", str_trim(tax_df(physeqft_fam)$famid))
+physeqft_fam
+```
+
+# Preproc 16S
+```{r}
+# Remove other timepoints, remove NA asthma
+phy <- subset_samples(phy, sample_data(phy)$Time == "1y")
+phy
+
+samdat <- sample_data(phy) |> 
+  data.frame() |> 
+  rename(abcno = ABCNO) |>
+  mutate(abcno = as.character(abcno)) |> 
+  left_join(J45_cox_cross |> mutate(abcno = as.character(abcno))) |> 
+  left_join(sample_df(physeqf) |> dplyr::select(abcno, oldchild01, rural_urban))
+rownames(samdat) <- sample_names(phy)
+sample_data(phy) <- sample_data(samdat)
+
+# filter to abcno in virome
+phy <- subset_samples(phy, abcno %in% sample_df(physeqf)$abcno)
+sample_names(phy) <- sample_df(phy)$abcno
+
+phy <- prune_taxa(taxa_sums(phy) > 0, phy)
+phy
+
+tax_table(phy) <- tax_df(phy) |> 
+  mutate(Genus = str_replace_all(str_trim(as.character(Genus)), "-", "_")) |> 
+  dplyr::select(-tax) |> 
+  as.matrix()
+
+# Agglomerate to genus
+print("STEP: Agglomerate taxonomic level")
+phy.g <- speedyseq::tax_glom(phy, "Genus")
+taxa_names(phy.g) <- paste0("g_", tax_df(phy.g)$Genus)
+phy.g
+```
+
+# FIG4AB
+```{r}
+df2 <- calculate_alpha(phy)
+df <- calculate_alpha(physeqft)
+# calibrate the data
+df2$Shannon_cal <- median(df2$Shannon) + resid(lm(Shannon ~ log(Reads) + Reads, data=df2))
+df2$Observed_cal <- median(df2$Observed) + resid(lm(Observed ~ log(Reads) + Reads, data=df2))
+
+df$Shannon_cal <- median(df$Shannon) + resid(lm(Shannon ~ mapDepth + log(mapDepth) + mapDepth, data=df))
+df$Observed_cal <- median(df$Observed) + resid(lm(Observed ~ mapDepth + log(mapDepth) + mapDepth, data=df))
+
+x = df |> 
+  left_join(df2 |>
+              dplyr::select(abcno, Shannon_cal, Observed_cal) |>
+              rename(shannon_bac = Shannon_cal, obs_bac = Observed_cal))
+
+cor.test(~ Shannon_cal + shannon_bac, data=subset(x, j45_5yr_ever == "0"), method="spearman")
+cor.test(~ Shannon_cal + shannon_bac, data=subset(x, j45_5yr_ever == "1"), method="spearman")
+cor.test(~ Observed_cal + obs_bac, data=subset(x, j45_5yr_ever == "0"), method="spearman")
+cor.test(~ Observed_cal + obs_bac, data=subset(x, j45_5yr_ever == "1"), method="spearman")
+
+
+shannon_pl <- ggplot(x, aes(x=Shannon_cal, y=shannon_bac, color=j45_5yr_ever)) +
+  geom_point(alpha=.5, size=1) + geom_smooth(method="lm", se=F) + 
+  theme_minimal() + 
+  scale_color_manual(values=color_map) + 
+  guides(color="none") +
+  annotate("text", x = 1, y = 4,
+              label = "paste(italic(rho), \" = 0.08 (P = 0.38)\")", parse = TRUE, color="#f6511d") +
+  annotate("text", x = 1, y = 3.7,
+           label = "paste(italic(rho), \" = 0.09 (P = 0.06)\")", parse = TRUE, color="#61a0af") +
+  xlab("Evenness (temperate phageome)") + ylab("Evenness (16S)")
+shannon_pl
+
+obs_pl <- ggplot(x, aes(x=Observed, y=obs_bac, color=j45_5yr_ever)) +
+  geom_point(alpha=.5, size=1) + geom_smooth(method="lm", se=F) + 
+  theme_minimal() + 
+  scale_color_manual(values=color_map) + 
+  guides(color="none") +
+  annotate("text", x = 450, y = 150,
+              label = "paste(italic(rho), \" = 0.20 (P = 0.03)\")", parse = TRUE, color="#f6511d") +
+  annotate("text", x = 450, y = 140,
+           label = "paste(italic(rho), \" = 0.20 (P < 0.01)\")", parse = TRUE, color="#61a0af") +
+  xlab("Richness (temperate virome)") + ylab("Richness (16S)")
+obs_pl
+
+cowplot::plot_grid(obs_pl, shannon_pl, nrow=2, labels=c("c", "d"))
+ggsave("figures/FIG4AB.pdf", device="pdf", dpi=300,
+       width=4, height=6)
+```
+
+# FIG4CD
+```{r}
+# temperate vOTUs
+dist.aitch.sp_temp <- readRDS("data/distance_species_temperate_euclidean.rds")[[1]]
+# temperate VFC
+dist.aitch.f_temp <- readRDS("data/distance_famid_temperate_euclidean.rds")[[1]]
+```
+
+```{r}
+# filter and reorder to abcno in virome
+bac <- subset_samples(phy.g, abcno %in% sample_df(physeqft)$abcno)
+physeqft_g_bac <- subset_samples(physeqft, abcno %in% sample_df(bac)$abcno)
+
+bac <- ps_reorder(bac, sample_names(physeqft_g_bac))
+```
+
+```{r}
+registerDoParallel(3)
+aitch_dist_bac <- phyloseq::distance(transform_phy(bac, transform = "clr"),
+                          method="euclidean", parallel = TRUE)
+sample_data(bac)$asthma_mother <- sample_df(bac) |> select(abcno) |> left_join(phenodata_all |> select(abcno, asthma_mother) |> mutate(abcno = as.character(abcno))) |> pull(asthma_mother)
+```
+
+## Constrained towards asthma
+### vOTU
+```{r}
+# Procrustes
+procrustes_sp <- protest(dbrda(subset_dist(dist.aitch.sp_temp, physeqft_g_bac) ~ j45_5yr_ever + Condition(lane), sample_df(physeqft_g_bac)),
+                       dbrda(aitch_dist_bac ~ j45_5yr_ever + Condition(Tray), sample_df(bac)), symmetry = T)
+
+plot_procrustes(procrustes_sp, var = sample_df(bac)$j45_5yr_ever)
+```
+
+```{r}
+resid_procrustes_fx <- data.frame(abcno = sample_names(physeqft_g_bac), residuals = resid(procrustes_sp)) |>
+  left_join(sample_df(physeqft_g_bac))
+
+ggplot(resid_procrustes_fx, aes(x=fct_rev(j45_5yr_ever), y=residuals, color=j45_5yr_ever, fill=j45_5yr_ever)) + 
+  geom_violin(alpha=.3, trim=F) +
+  stat_summary(fun.data=mean_sdl,
+                 geom="pointrange") +
+  stat_compare_means(aes(label = paste0("P = ", ..p.format..)),
+                     size=3.5, label.x.npc="center") +
+  theme_pubclean(base_size=12) +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  guides(fill="none", color="none") +
+  scale_fill_manual(values=color_map) +
+  scale_color_manual(values=color_map) + 
+  xlab("")
+ggsave("figures/FIG4Cr.pdf", device="pdf", dpi=300, width=2, height=2, bg="transparent")
+```
+
+### VFC
+```{r}
+# Procrustes
+procrustes_vfc <- protest(dbrda(subset_dist(dist.aitch.f_temp, physeqft_g_bac) ~ j45_5yr_ever + Condition(lane), sample_df(physeqft_g_bac)),
+                       dbrda(aitch_dist_bac ~ j45_5yr_ever + Condition(Tray), sample_df(bac)))
+plot_procrustes(procrustes_vfc, var = sample_df(bac)$j45_5yr_ever)
+```
+```{r}
+resid_procrustes_fx <- data.frame(abcno = sample_names(physeqft_g_bac), residuals = resid(procrustes_vfc)) |>
+  left_join(sample_df(physeqft_g_bac))
+
+ggplot(resid_procrustes_fx, aes(x=fct_rev(j45_5yr_ever), y=residuals, color=j45_5yr_ever, fill=j45_5yr_ever)) + 
+  geom_violin(alpha=.3, trim=F) +
+  stat_summary(fun.data=mean_sdl, #mult=1, 
+                 geom="pointrange") +
+  stat_compare_means(aes(label = paste0("P = ", ..p.format..)),
+                     size=3.5, label.x.npc="center") +
+  theme_pubclean(base_size=12) +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  guides(fill="none", color="none") +
+  scale_fill_manual(values=color_map) +
+  scale_color_manual(values=color_map) + 
+  xlab("")
+ggsave("figures/FIG4Dr.pdf", device="pdf", dpi=300, width=2, height=2, bg="transparent")
+```
+
+```{r}
+cowplot::plot_grid(plot_procrustes(procrustes_sp, var = sample_df(bac)$j45_5yr_ever) + guides(color="none") + ggtitle("Temperate virome (vOTUs)\nvs. 16S (genus)"),
+                   plot_procrustes(procrustes_vfc, var = sample_df(bac)$j45_5yr_ever) + guides(color="none") + ggtitle("Temperate virome (VFCs)\nvs. 16S (genus)"),
+                   nrow=2,
+                   labels = c("a", "b"))
+
+ggsave("figures/FIG4CD.pdf", device="pdf", dpi = 300,
+       width=4, height=6)
+```
+
+# FIG5A
+## Virome
+```{r, fig.height=3.5, fig.width=5}
+copdat_scores |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score*asthma_mother, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+```
+
+```{r}
+# asthma_mother == 1
+fit.1 <- copdat_scores |> 
+  filter(asthma_mother == 1) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+fit.1
+
+# asthma_mother == 0
+fit.2 <- copdat_scores |> 
+  filter(asthma_mother == 0) |> 
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+fit.2
+```
+
+## 16S
+```{r, fig.height=3.5, fig.width=5}
+copdat_scores |> 
+  glm(j45_5yr_ever ~ zscore_bac_pls_score*asthma_mother, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+```
+
+```{r}
+# asthma_mother == 1
+fit.1x <- copdat_scores |> 
+  filter(asthma_mother == 1) |> 
+  glm(j45_5yr_ever ~ zscore_bac_pls_score, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+fit.1x
+
+# asthma_mother == 0
+fit.2x <- copdat_scores |> 
+  filter(asthma_mother == 0) |> 
+  glm(j45_5yr_ever ~ zscore_bac_pls_score, data=_, family=binomial("logit")) |> 
+  tidylog(exp=T, conf.int=T)
+fit.2x
+```
+
+```{r}
+df <- fit.2 |> 
+  mutate(outcome = "asthma",
+         group = "Non-asthmatic mother",
+         data = "Virome") |> 
+  bind_rows(fit.1 |> 
+              mutate(outcome = "asthma",
+                     group = "Asthmatic mother",
+                     data = "Virome")) |> 
+  bind_rows(fit.2x |> 
+              mutate(outcome = "asthma",
+                     group = "Non-asthmatic mother",
+                     data = "16S")) |> 
+  bind_rows(fit.1x |> 
+              mutate(outcome = "asthma",
+                     group = "Asthmatic mother",
+                     data = "16S")) |> 
+  filter(term != "(Intercept)") |> 
+  dplyr::select(outcome, estimate, conf.low, conf.high, p.value, group, data)
+
+df |> 
+  ggplot(aes(x=data, y=estimate, color=group)) +
+    geom_hline(yintercept=1, linetype=2, lwd=.2) +
+    geom_point(position=position_dodge(width=0.2)) +
+    geom_linerange(aes(xend=data, ymin=conf.low, ymax=conf.high),
+                 position=position_dodge(width=0.2)) +
+    coord_flip() +
+    xlab("") + ylab("OR") +
+    scale_color_colorblind() +
+    #guides(color="none") +
+    theme_pubr(base_size=12)
+
+ggsave("figures/FIG5A.pdf", device="pdf", dpi=300,
+       width=3, height=2.5)
+```
+
+
+# FIG5B
+## Virome
+```{r}
+mygee(copdat_scores, "zscore_vir_pls_score", 5) + theme_pubr(base_size=10)
+ggsave("figures/FIG5Bvir.pdf", device="pdf", dpi=300,
+       width=4, height=3.5)
+```
+
+## 16S
+```{r}
+mygee(copdat_scores, "zscore_bac_pls_score", 5) + theme_pubr(base_size=10)
+ggsave("figures/FIG5Bbac.pdf", device="pdf", dpi=300,
+       width=4, height=3.5)
+```
+
+# Mediation analysis
+## step 1: Y \~ X
+```{r}
+model.1 <- copdat_scores |>
+              glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, 
+                  family="binomial")
+                  
+model.1 |> tidylog(conf.int=T, exp=T)
+```
+
+## step 2: M ~ X
+```{r}
+model.M <- copdat_scores |>
+  lm(zscore_bac_pls_score ~ zscore_vir_pls_score,
+     data=_)
+
+tidylog(model.M, conf.int = T)
+```
+
+## step 3: Y \~ X + M
+```{r}
+model.Y <- copdat_scores |>
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  lm(asthma ~ zscore_vir_pls_score + zscore_bac_pls_score,
+               data = _)
+
+model.Y |> tidylog(conf.int = T, exp=T)
+```
+
+## step 4: mediation
+```{r, fig.width=3, fig.height=4}
+set.seed(11)
+mediation_results <- mediation::mediate(model.M, model.Y,
+                   treat='zscore_vir_pls_score',
+                   mediator='zscore_bac_pls_score',
+                   control.value=0, treat.value =1,
+                   boot=TRUE, sims=1000)
+summary(mediation_results)
+```
+
+## FIG5C
+```{r}
+data.frame(term = factor(c("Causal\nmediation effect\n (Virome through 16S)", "Direct effect\n(Virome)", "Total effect\n(Virome + 16S)"),
+                         levels=c("Total effect\n(Virome + 16S)", "Direct effect\n(Virome)", "Causal\nmediation effect\n (Virome through 16S)")),
+           estimate = c(0.01196, 0.03995, 0.05192),
+           conf.low = c(0.00141, 0.00385, 0.01682),
+           conf.high = c(0.02, 0.08, 0.09),
+           group = factor(c(rep("Average", 3)),
+                          levels=c("Average"))) |> 
+  ggplot(aes(x=term, y=estimate)) +
+  geom_point(aes(color=group), position=position_dodge(width=0.2)) +
+  geom_linerange(aes(x=term, ymin=conf.low, ymax=conf.high, color=group),
+                 position=position_dodge(width=0.2)) +
+  coord_flip() +
+  geom_hline(yintercept=0, linetype=2) +
+  scale_color_manual(values=c(color_map2, c("Average" = "black"))) +
+  xlab("") + ylab("Estimate") +
+  theme_pubr(base_size=10) +
+  guides(color="none")
+
+ggsave("figures/FIG5C.pdf", width=4, height=2.5)  
+```
+
+## moderator: asthma-mother
+### step 2: M \~ X
+```{r}
+model.M <- copdat_scores |>
+  lm(zscore_bac_pls_score ~ zscore_vir_pls_score*asthma_mother,
+     data=_)
+
+tidylog(model.M, conf.int = T)
+```
+
+### step 3: Y \~ X + M
+```{r}
+model.Y <- copdat_scores |>
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  lm(asthma ~ zscore_vir_pls_score*asthma_mother + zscore_bac_pls_score*asthma_mother,
+               data =_)
+
+model.Y |> tidylog(conf.int = T, exp=T)
+```
+
+### step 4: mediation
+```{r, fig.width=3, fig.height=4}
+set.seed(11)
+mediation_results_mod <- mediation::mediate(model.M, model.Y,
+                   treat='zscore_vir_pls_score',
+                   mediator='zscore_bac_pls_score',
+                   boot=TRUE, sims=10)
+test.modmed(mediation_results_mod,
+            covariates.1 = list(asthma_mother = 1),
+            covariates.2 = list(asthma_mother = 0),
+            sims=1000)
+```
+
+## stratification: asthma-mother
+### step 2: M ~ X
+```{r}
+model.M <- copdat_scores |> 
+  filter(asthma_mother == 1) |> 
+  lm(zscore_bac_pls_score ~ zscore_vir_pls_score,
+     data=_)
+
+tidylog(model.M, conf.int = T)
+```
+
+### step 3: Y \~ X + M
+```{r}
+model.Y <- copdat_scores |>
+  filter(asthma_mother == 1) |> 
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  lm(asthma ~ zscore_vir_pls_score + zscore_bac_pls_score,
+               data = _)
+
+model.Y |> tidylog(conf.int = T, exp=T)
+```
+
+### step 4: mediation
+```{r, fig.width=3, fig.height=4}
+set.seed(11)
+mediation_results <- mediation::mediate(model.M, model.Y,
+                   treat='zscore_vir_pls_score',
+                   mediator='zscore_bac_pls_score',
+                   control.value=0, treat.value =1,
+                   boot=TRUE, sims=1000)
+summary(mediation_results)
+```
+
+## stratification: non-asthma mother
+### step 2: M ~ X
+```{r}
+model.M <- copdat_scores |> 
+  filter(asthma_mother == 0) |> 
+  lm(zscore_bac_pls_score ~ zscore_vir_pls_score, data=_)
+
+tidylog(model.M, conf.int = T)
+```
+
+### step 3: Y \~ X + M
+```{r}
+model.Y <- copdat_scores |>
+  filter(asthma_mother == 0) |> 
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  lm(asthma ~ zscore_vir_pls_score + zscore_bac_pls_score,
+               data = _)
+
+model.Y |> tidylog(conf.int = T, exp=T)
+```
+
+### step 4: mediation
+```{r, fig.width=3, fig.height=4}
+set.seed(11)
+mediation_results <- mediation::mediate(model.M, model.Y,
+                   treat='zscore_vir_pls_score',
+                   mediator='zscore_bac_pls_score',
+                   control.value=0, treat.value =1,
+                   boot=TRUE, sims=1000)
+summary(mediation_results)
+```
+
+# Reverse mediation bac - vir - asthma
+## step 1: Y \~ X
+```{r}
+model.1x <- copdat_scores |>
+              glm(j45_5yr_ever ~ zscore_bac_pls_score, 
+                  data=_,
+                  family="binomial")
+                  
+model.1x |> tidylog(conf.int=T, exp=T)
+```
+
+### step 2: M ~ X
+```{r}
+model.Mx <- copdat_scores |>
+  lm(zscore_vir_pls_score ~ zscore_bac_pls_score,
+     data=_)
+
+tidylog(model.Mx, conf.int = T)
+```
+
+### step 3: Y ~ X + M
+```{r}
+model.Yx <- copdat_scores |>
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  lm(asthma ~ zscore_bac_pls_score + zscore_vir_pls_score,
+               data=_)
+
+model.Yx |> tidylog(conf.int = T, exp=T)
+```
+
+### step 4: mediation
+```{r, fig.width=3, fig.height=4}
+set.seed(11)
+mediation_results.x <- mediation::mediate(model.Mx, model.Yx,
+                   treat='zscore_bac_pls_score',
+                   mediator='zscore_vir_pls_score',
+                   boot=TRUE, sims=1000)
+summary(mediation_results.x)
+```
+
+
+# FIG5E
+```{r}
+m0 <- copdat_scores |>
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  glm(j45_5yr_ever ~ 1, data=_, family="binomial")
+
+m1 <- copdat_scores |> 
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  glm(j45_5yr_ever ~ zscore_vir_pls_score, data=_, family="binomial")
+
+m2 <- copdat_scores |> 
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  glm(j45_5yr_ever ~ zscore_vir_pls_score + zscore_bac_pls_score, data=_, family="binomial")
+
+m3 <- copdat_scores |> 
+  mutate(asthma = as.numeric(j45_5yr_ever)-1) |>
+  glm(j45_5yr_ever ~ zscore_bac_pls_score, data=_, family="binomial")
+
+lrtest(m1, m2) # vir vs. vir + bac
+lrtest(m3, m2) # bac vs. vir + bac 
+```
+
+```{r}
+fit.vir <- glm(j45_5yr_ever ~ zscore_vir_pls_score, data=copdat_scores, family="binomial")
+fit.bac <- glm(j45_5yr_ever ~ zscore_bac_pls_score, data=copdat_scores, family="binomial")
+fit.vir_bac <- glm(j45_5yr_ever ~ zscore_vir_pls_score + zscore_bac_pls_score, data=copdat_scores, family="binomial")
+
+r2.vir <- r2(fit.vir)
+r2.bac <- r2(fit.bac)
+r2.vir_bac <- r2(fit.vir_bac)
+
+df <- data.frame(r2 = c(as.numeric(r2.vir), as.numeric(r2.bac), as.numeric(r2.vir_bac)), group=c("Virome", "16S", "Virome + 16S"))
+
+ggplot(df, aes(x=group, y=r2*100, fill=group)) +
+  geom_col() + 
+  theme_pubr(base_size=10) +
+  xlab("") +
+  guides(fill="none")
+
+ggsave("figures/FIG5E.pdf", device="pdf", width=2, height=2)  
+```
+
+# Survival analysis
+## Groupings
+```{r}
+surv_data <- copdat_scores |> 
+  mutate(vir_score_group = as.numeric(gtools::quantcut(zscore_vir_pls_score, q = 2))-1,
+         bac_score_group = as.numeric(gtools::quantcut(zscore_bac_pls_score, q = 2))-1) |> 
+  mutate(signature_group = case_when(bac_score_group == 1 & vir_score_group == 1 ~ "bac-H & vir-H",
+                                     bac_score_group == 1 & vir_score_group == 0 ~ "bac-H & vir-L",
+                                     bac_score_group == 0 & vir_score_group == 0 ~ "bac-L & vir-L",
+                                     bac_score_group == 0 & vir_score_group == 1 ~ "bac-L & vir-H"),
+         siganture_group = as.factor(signature_group),
+         signature_scale3g = case_when(signature_group == "bac-L & vir-L" ~ 1,
+                                     signature_group %in% c("bac-H & vir-L", "bac-L & vir-H") ~ 2,
+                                     signature_group == "bac-H & vir-H" ~ 3),
+         signature_scale4g = case_when(signature_group == "bac-L & vir-L" ~ 1,
+                                     signature_group == "bac-H & vir-L" ~ 2,
+                                     signature_group == "bac-L & vir-H" ~ 3,
+                                     signature_group == "bac-H & vir-H" ~ 4)) |> 
+  dplyr::select(abcno, zscore_vir_pls_score, zscore_bac_pls_score, vir_score_group, bac_score_group, signature_group, signature_scale3g, signature_scale4g, j45_5yr_ever, asthma_mother) |> 
+  left_join(phenodata_all |> dplyr::select(abcno, eventage_j45_5yr, event_j45_5yr))
+```
+
+```{r}
+table(surv_data$signature_group)
+```
+
+
+## FIG5D
+```{r}
+km_fit <- survfit(Surv(eventage_j45_5yr, event_j45_5yr == 1) ~ signature_group, data=surv_data)
+summary(km_fit)
+pl <- ggsurvplot(km_fit, fun = "event", conf.int=F,
+           xlab = "Time in days",
+           break.time.by = 365.25,
+           ggtheme = theme_pubr(),
+           pval = T)
+pl
+pdf("figures/FIG5D.pdf",
+       width=5, height=5)
+print(pl, newpage=F)
+dev.off()
+```
+
+## Cox regression
+```{r}
+cox_4g <- coxph(Surv(eventage_j45_5yr, event_j45_5yr == 1) ~ signature_scale4g, data=surv_data)
+broom::tidy(cox_4g, exp=T, conf.int=T)
+```
+
+```{r}
+cox_3g <- coxph(Surv(eventage_j45_5yr, event_j45_5yr == 1) ~ signature_scale3g, data=surv_data)
+broom::tidy(cox_3g, exp=T, conf.int=T)
+```
+
+# session info
+```{r}
+sessionInfo()
+```
+
